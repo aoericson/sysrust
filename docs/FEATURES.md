@@ -99,28 +99,59 @@ Last updated: 2026-03-29
 | mem, threads, spawn      | OK        | OK             | |
 | mirror, reboot           | OK        | OK             | |
 
-### C Compiler (built-in)
+### Built-in Compiler
+
+Each OS has its own compiler matching its language. opsys compiles C; sysrust compiles a Rust subset.
+
+#### opsys: C Compiler
+
+| Feature                  | opsys (C) | Notes |
+|--------------------------|-----------|-------|
+| Lexer (67 tokens)        | OK        | |
+| Parser (recursive desc)  | OK        | |
+| x86 emitter              | OK        | |
+| Symbol table (31 builtins)| OK       | |
+| Types: int, char, void, ptr | OK     | |
+| Control: if/else/while/for | OK      | |
+| Operators (full set)     | OK        | |
+| Strings + #define        | OK        | |
+| Structs                  | OK        | |
+| Ternary + do-while       | OK        | |
+| Enum support             | OK        | |
+| Switch/case              | OK        | |
+| #include (dedup)         | OK        | |
+| typedef                  | OK        | |
+| Function prototypes      | OK        | |
+| static/const/extern kw   | OK        | |
+| Array fields in structs  | OK        | |
+| unsigned/signed/short/long| OK       | |
+
+#### sysrust: Rust-Subset Compiler (rc)
+
+| Feature                  | sysrust   | Notes |
+|--------------------------|-----------|-------|
+| Lexer (Rust tokens)      | TODO      | fn, let, mut, struct, if/else, while, for, loop |
+| Parser (recursive desc)  | TODO      | Single-pass codegen, Rust syntax |
+| x86 emitter              | OK        | Shared architecture with C compiler |
+| Symbol table             | TODO      | Rust-style: fn, let, struct |
+| Types: i32, u8, u32, bool| TODO      | No lifetimes, no generics |
+| Pointers: *const/*mut    | TODO      | Raw pointers only |
+| Control: if/while/for/loop| TODO     | No match (initially) |
+| let/let mut bindings     | TODO      | Type inference not needed (explicit types) |
+| fn with -> return type   | TODO      | |
+| Structs (no impl)        | TODO      | Value types, field access |
+| Arrays: [T; N]           | TODO      | Fixed-size |
+| Operators (full set)     | TODO      | Same as C compiler |
+| String literals (b"...")  | TODO      | Byte strings |
+| Kernel builtins          | TODO      | puts, putchar, malloc, etc. |
+| Test programs (.rs)      | TODO      | Rewrite 23 C programs in Rust subset |
+
+### Build Tools
 
 | Feature                  | opsys (C) | sysrust (Rust) | Notes |
 |--------------------------|-----------|----------------|-------|
-| Lexer (67 tokens)        | OK        | OK             | |
-| Parser (recursive desc)  | OK        | OK             | |
-| x86 emitter              | OK        | OK             | |
-| Symbol table (31 builtins)| OK       | OK             | |
-| Types: int, char, void, ptr | OK     | OK             | |
-| Control: if/else/while/for | OK      | OK             | |
-| Operators (full set)     | OK        | OK             | |
-| Strings + #define        | OK        | OK             | |
-| Structs                  | OK        | OK             | |
-| Ternary + do-while       | OK        | OK             | |
-| Enum support             | OK        | TODO           | Post-v0.3, not yet ported |
-| Switch/case              | OK        | TODO           | Post-v0.3, not yet ported |
-| #include (dedup)         | OK        | OK             | sysrust ported at v0.3 level |
-| typedef                  | OK        | TODO           | Post-v0.3, not yet ported |
-| Function prototypes      | OK        | TODO           | Post-v0.3, not yet ported |
-| static/const/extern kw   | OK        | TODO           | Post-v0.3, not yet ported |
-| Array fields in structs  | OK        | TODO           | Post-v0.3, not yet ported |
-| unsigned/signed/short/long| OK       | TODO           | Post-v0.3, not yet ported |
+| mkinitrd (host tool)     | C binary  | TODO: build.rs | Fold into cargo build process |
+| Test programs language   | .c files  | TODO: .rs files | Match guest compiler language |
 
 ### Crash Recovery
 
@@ -157,16 +188,20 @@ Last updated: 2026-03-29
 - [x] VGA volatile writes
 - [x] Initial commit + push
 
-### M2: sysrust Feature Parity with opsys HEAD
+### M2: sysrust Rust-Subset Compiler
 
-Port post-v0.3 compiler features to sysrust.
+Replace the C compiler with a Rust-subset compiler. Zero C code in sysrust.
 
-- [ ] Enum support
-- [ ] Switch/case
-- [ ] typedef, unsigned/signed/short/long keywords
-- [ ] Function prototypes
-- [ ] static/const/extern keywords
-- [ ] Array fields in structs
+- [ ] Remove tools/mkinitrd.c, fold into build.rs
+- [ ] Design Rust-subset language spec
+- [ ] New lexer (rc/lex.rs) for Rust tokens
+- [ ] New parser (rc/parse.rs) for Rust syntax, single-pass codegen
+- [ ] Adapt symbol table (rc/sym.rs) for Rust-style declarations
+- [ ] Reuse x86 emitter (rc/emit.rs) from existing cc/emit.rs
+- [ ] Update shell: `rc` command replaces `cc`
+- [ ] Rewrite 23 test programs in Rust subset
+- [ ] Update autotest mode for .rs programs
+- [ ] Remove all .c files from programs/
 
 ### M3: opsys Self-Hosting Compiler
 
@@ -176,9 +211,16 @@ The C compiler inside opsys can compile its own source.
 - [ ] Multi-file compilation or large-file support
 - [ ] Self-hosting test
 
-### M4: Shared Next-Generation Features
+### M4: sysrust Self-Hosting Compiler
 
-New features developed in both projects simultaneously.
+The Rust-subset compiler inside sysrust can compile its own source.
+
+- [ ] Sufficient language features for self-hosting
+- [ ] Self-hosting test
+
+### M5: Shared Next-Generation Features
+
+New features developed in both projects (each in their own language).
 
 - [ ] TCP server
 - [ ] Ring 3 / userspace isolation
@@ -191,5 +233,8 @@ New features developed in both projects simultaneously.
 
 | Date | Feature | opsys | sysrust | Reason |
 |------|---------|-------|---------|--------|
-| 2026-03-29 | Post-v0.3 compiler | OK | TODO | Rust port created from v0.3 snapshot |
+| 2026-03-29 | Guest language | C | Rust subset | Each OS is pure in its own language |
+| 2026-03-29 | Built-in compiler | cc (C compiler) | rc (Rust compiler) | Language purity |
+| 2026-03-29 | Host tools | mkinitrd.c | build.rs | No C code in sysrust |
+| 2026-03-29 | Test programs | .c files | .rs files | Match guest language |
 | 2026-03-29 | Serial port | :2323 | :2324 | Avoid conflict when running side-by-side |
