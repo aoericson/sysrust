@@ -1,0 +1,9 @@
+target/
+kernel.elf
+initrd.img
+disk.img
+test_output.txt
+tools/mkinitrd
+sysroot/
+.swarm/
+errors.txt
