@@ -12,11 +12,11 @@ debug: FORCE
 	cp target/x86-opsys/debug/opsys kernel.elf
 
 # Host tools
-tools/mkinitrd: tools/mkinitrd.c
-	gcc -o $@ $<
+tools/mkinitrd: tools/mkinitrd.rs
+	rustc -o $@ $<
 
 # Programs to include in initrd
-PROGRAMS = $(wildcard programs/*.c) $(wildcard programs/*.h)
+PROGRAMS = $(wildcard programs/*.rs)
 
 sysroot/hello.txt:
 	mkdir -p sysroot
@@ -28,8 +28,7 @@ sysroot/readme.txt:
 
 sysroot/programs: $(PROGRAMS)
 	mkdir -p sysroot
-	@if ls programs/*.c >/dev/null 2>&1; then cp programs/*.c sysroot/; fi
-	@if ls programs/*.h >/dev/null 2>&1; then cp programs/*.h sysroot/; fi
+	@if ls programs/*.rs >/dev/null 2>&1; then cp programs/*.rs sysroot/; fi
 
 initrd.img: tools/mkinitrd sysroot/hello.txt sysroot/readme.txt sysroot/programs
 	tools/mkinitrd initrd.img $(wildcard sysroot/*)

@@ -6,7 +6,7 @@
 //
 // Built-in commands:
 //   help, clear, echo, ls, cat, mem, ping, resolve, touch, write, edit,
-//   cc, run, tcp, http, save, load, threads, spawn, mirror, reboot
+//   rc, run, tcp, http, save, load, threads, spawn, mirror, reboot
 
 use crate::vga::{self, Color};
 use crate::keyboard;
@@ -21,7 +21,7 @@ use crate::dns;
 use crate::net;
 use crate::tcp;
 use crate::fat16;
-use crate::cc;
+use crate::rc;
 use crate::recovery;
 use crate::thread;
 use crate::editor;
@@ -171,7 +171,7 @@ unsafe fn cmd_help() {
     vga::puts(b"  touch   - create an empty file (usage: touch <name>)\n");
     vga::puts(b"  write   - write text to a file (usage: write <name> <text>)\n");
     vga::puts(b"  edit    - text editor (usage: edit <filename>)\n");
-    vga::puts(b"  cc      - compile a C source file (usage: cc <file.c>)\n");
+    vga::puts(b"  rc      - compile a Rust source file (usage: rc <file.rs>)\n");
     vga::puts(b"  run     - run compiled program (usage: run <binary>)\n");
     vga::puts(b"  tcp     - TCP client (usage: tcp <ip|host> <port>)\n");
     vga::puts(b"  http    - HTTP GET (usage: http <ip|host> [path])\n");
@@ -689,7 +689,7 @@ unsafe fn cmd_run() {
     }
 
     // Load at CC_LOAD_BASE -- the default compiler target
-    let load_addr = cc::emit::CC_LOAD_BASE as *mut u8;
+    let load_addr = rc::emit::CC_LOAD_BASE as *mut u8;
     let n = vfs::read(node, 0, (*node).size, load_addr);
     if n <= 0 {
         vga::puts(b"Read error\n");
@@ -950,14 +950,14 @@ pub unsafe fn run() -> ! {
             } else {
                 vga::puts(b"Usage: edit <filename>\n");
             }
-        } else if string::strncmp(input_ptr, b"cc\0".as_ptr(), 2) == 0
+        } else if string::strncmp(input_ptr, b"rc\0".as_ptr(), 2) == 0
             && (INPUT[2] == b' ' || INPUT[2] == 0)
         {
             if INPUT_LEN > 3 {
                 INPUT[INPUT_LEN] = 0;
-                cc::cc_compile(INPUT[3..].as_ptr(), core::ptr::null());
+                rc::rc_compile(INPUT[3..].as_ptr(), core::ptr::null());
             } else {
-                vga::puts(b"Usage: cc <file.c>\n");
+                vga::puts(b"Usage: rc <file.rs>\n");
             }
         } else if string::strncmp(input_ptr, b"run\0".as_ptr(), 3) == 0
             && (INPUT[3] == b' ' || INPUT[3] == 0)

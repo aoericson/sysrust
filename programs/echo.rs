@@ -1,10 +1,10 @@
-/* echo.c -- tests: getchar, putchar, while loop, char comparison */
-int main() {
-    int c;
+// echo.rs -- tests: getchar, putchar, loop, char comparison
+fn main() -> i32 {
+    let mut c: i32;
     puts("Type text (press ESC to quit):\n");
-    while (1) {
+    loop {
         c = getchar();
-        if (c == 27) {
+        if c == 27 {
             puts("\nBye!\n");
             return 0;
         }

@@ -11,7 +11,7 @@
 use core::arch::asm;
 use core::mem::size_of;
 
-use crate::cc::emit::{CC_LOAD_BASE, CC_CODE_MAX};
+use crate::rc::emit::{CC_LOAD_BASE, CC_CODE_MAX};
 
 /// Register state pushed onto the stack by isr_common_stub.
 ///

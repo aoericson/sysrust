@@ -40,7 +40,7 @@ mod udp;
 mod tcp;
 mod dns;
 mod rtl8139;
-mod cc;
+mod rc;
 mod shell;
 mod editor;
 mod recovery;
@@ -175,21 +175,21 @@ pub extern "C" fn kernel_main(magic: u32, mb_info: *const MultibootInfo) -> ! {
                 vga::puts(b"Autotest mode\n");
                 vga::puts(b"AUTOTEST START\n");
 
-                vga::puts(b"Compiling hello.c...\n");
-                if cc::cc_compile(b"hello.c\0".as_ptr(), b"hello.bin\0".as_ptr()) != 0 {
-                    vga::puts(b"FAIL compile hello.c\n");
+                vga::puts(b"Compiling hello.rs...\n");
+                if rc::rc_compile(b"hello.rs\0".as_ptr(), b"hello.bin\0".as_ptr()) != 0 {
+                    vga::puts(b"FAIL compile hello.rs\n");
                     vga::puts(b"AUTOTEST END\n");
                     loop { asm!("hlt"); }
                 }
                 vga::puts(b"Running hello.bin...\n");
                 if let Some(node) = vfs::finddir_root(b"hello.bin\0".as_ptr()) {
-                    let load = cc::emit::CC_LOAD_BASE as *mut u8;
+                    let load = rc::emit::CC_LOAD_BASE as *mut u8;
                     let n = vfs::read(node, 0, (*node).size, load);
                     if n > 0 {
                         let entry: extern "C" fn() -> i32 =
-                            core::mem::transmute(cc::emit::CC_LOAD_BASE as *const ());
+                            core::mem::transmute(rc::emit::CC_LOAD_BASE as *const ());
                         let result = entry();
-                        vga::puts(b"hello.c returned ");
+                        vga::puts(b"hello.rs returned ");
                         vga::putchar(b'0' + result as u8);
                         vga::putchar(b'\n');
                     } else {
@@ -199,15 +199,15 @@ pub extern "C" fn kernel_main(magic: u32, mb_info: *const MultibootInfo) -> ! {
                     vga::puts(b"FAIL find hello.bin\n");
                 }
 
-                vga::puts(b"Compiling test.c...\n");
-                if cc::cc_compile(b"test.c\0".as_ptr(), b"test.bin\0".as_ptr()) == 0 {
+                vga::puts(b"Compiling test.rs...\n");
+                if rc::rc_compile(b"test.rs\0".as_ptr(), b"test.bin\0".as_ptr()) == 0 {
                     vga::puts(b"Running test.bin...\n");
                     if let Some(node) = vfs::finddir_root(b"test.bin\0".as_ptr()) {
-                        let load = cc::emit::CC_LOAD_BASE as *mut u8;
+                        let load = rc::emit::CC_LOAD_BASE as *mut u8;
                         let n = vfs::read(node, 0, 65536, load);
                         if n > 0 {
                             let entry: extern "C" fn() -> i32 =
-                                core::mem::transmute(cc::emit::CC_LOAD_BASE as *const ());
+                                core::mem::transmute(rc::emit::CC_LOAD_BASE as *const ());
                             let result = entry();
                             if result == 0 {
                                 vga::puts(b"AUTOTEST PASS\n");

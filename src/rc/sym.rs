@@ -1,4 +1,4 @@
-// cc/sym.rs -- Symbol table for the C subset compiler.
+// rc/sym.rs -- Symbol table for the Rust subset compiler.
 //
 // A flat array of symbols with scope depth tracking.  On entering
 // a new scope the depth increases; on leaving, all symbols at the
@@ -6,7 +6,7 @@
 // so inner scopes shadow outer ones.
 //
 // init() pre-populates the table with kernel built-in functions
-// so compiled code can call puts(), malloc(), etc.
+// so compiled Rust code can call puts(), malloc(), etc.
 
 use crate::string;
 use crate::vga;
@@ -37,6 +37,7 @@ pub struct Symbol {
     pub addr: u32,
     pub scope_depth: i32,
     pub struct_name: [u8; 32],
+    pub is_mutable: i32,
 }
 
 impl Symbol {
@@ -50,6 +51,7 @@ impl Symbol {
             addr: 0,
             scope_depth: 0,
             struct_name: [0u8; 32],
+            is_mutable: 0,
         }
     }
 }
@@ -106,7 +108,7 @@ static mut STRUCT_DEFS: [StructDef; MAX_STRUCT_DEFS] = [const { StructDef::new()
 static mut STRUCT_DEF_COUNT: i32 = 0;
 
 // C-ABI wrappers for Rust functions that take non-C-compatible types.
-// These are called from compiled C programs via raw function pointers.
+// These are called from compiled programs via raw function pointers.
 
 // vga::puts takes &[u8] (fat pointer), but C passes const char*.
 // This wrapper constructs a slice from the null-terminated pointer.
@@ -214,7 +216,7 @@ pub unsafe fn add(
     addr: u32,
 ) -> i32 {
     if SYM_COUNT >= MAX_SYMBOLS as i32 {
-        vga::puts(b"cc: symbol table full\n");
+        vga::puts(b"rc: symbol table full\n");
         return -1;
     }
 
@@ -266,7 +268,7 @@ pub unsafe fn leave_scope() {
 // Register a new struct type; returns pointer or null if table full
 pub unsafe fn struct_def_add(name: *const u8) -> *mut StructDef {
     if STRUCT_DEF_COUNT >= MAX_STRUCT_DEFS as i32 {
-        vga::puts(b"cc: struct definition table full\n");
+        vga::puts(b"rc: struct definition table full\n");
         return core::ptr::null_mut();
     }
     let d = &mut STRUCT_DEFS[STRUCT_DEF_COUNT as usize];

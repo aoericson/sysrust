@@ -1,13 +1,15 @@
-// cc/parse.rs -- Recursive-descent parser and code generator.
+// rc/parse.rs -- Recursive-descent parser and code generator for Rust syntax.
 //
 // Single-pass compilation: parses tokens and emits x86-32 machine code
 // directly via the emit module.  Every expression leaves its result
 // in EAX.  Binary operators use the pattern: push left, eval right to
 // EAX, mov right to ECX, pop left to EAX, compute result in EAX.
 //
-// Supported subset: int/char/void types, single-level pointers,
-// if/else, while, for, return, break, continue, function calls,
-// array indexing, address-of, pointer dereference, string literals.
+// Supported subset: i32/u8/u32/bool/usize/isize/void types, pointers
+// (*mut T, *const T, &T, &mut T), arrays [T; N], structs, enums,
+// if/else, while, loop, for-in-range, match, return, break, continue,
+// function calls, array indexing, address-of, pointer dereference,
+// string literals, as casts, unsafe blocks (transparent).
 
 use crate::string;
 use crate::vga;
@@ -79,8 +81,8 @@ unsafe fn print_line(line: i32) {
 }
 
 // Report a compile error with source line number
-unsafe fn cc_error(msg: &[u8]) {
-    vga::puts(b"cc: line ");
+unsafe fn rc_error(msg: &[u8]) {
+    vga::puts(b"rc: line ");
     print_line((*lex::peek()).line);
     vga::puts(b": ");
     vga::puts(msg);
@@ -120,7 +122,7 @@ unsafe fn add_fixup(name: *const u8, patch_pos: u32) {
         FIXUPS[FIXUP_COUNT as usize].patch_pos = patch_pos;
         FIXUP_COUNT += 1;
     } else {
-        cc_error(b"too many forward references\0");
+        rc_error(b"too many forward references\0");
     }
 }
 
@@ -175,7 +177,7 @@ unsafe fn add_string(text: *const u8, len: i32, patch_pos: u32) {
         STRINGS[idx].patch_pos = patch_pos;
         STRING_COUNT += 1;
     } else {
-        cc_error(b"too many string literals\0");
+        rc_error(b"too many string literals\0");
     }
 }
 
@@ -226,7 +228,7 @@ unsafe fn loop_pop() {
 
 unsafe fn loop_add_break(patch_pos: u32) {
     if LOOP_DEPTH <= 0 {
-        cc_error(b"break outside loop/switch\0");
+        rc_error(b"break outside loop\0");
         return;
     }
     let ctx = &mut LOOP_STACK[(LOOP_DEPTH - 1) as usize];
@@ -247,117 +249,141 @@ static mut EXPR_STRUCT_KIND: i32 = 0;
 static mut EXPR_STRUCT_OFFSET: i32 = 0;
 static mut EXPR_STRUCT_ADDR: u32 = 0;
 
+// ---- Array parsing state ----
+static mut IS_ARRAY: bool = false;
+static mut ARRAY_COUNT: i32 = 0;
+
 // ---- Convenience ----
 
 unsafe fn tok_is(t: i32) -> bool {
     (*lex::peek()).tok_type == t
 }
 
-// ---- After parse_type, if the type was 'struct Foo', this holds "Foo" ----
+// ---- After parse_type, if the type was a struct, this holds the struct name ----
 static mut PARSED_STRUCT_NAME: [u8; 32] = [0u8; 32];
 
-// Parse a type specifier; returns true if a type was found
+// Parse a type specifier; returns true if a type was found.
+// Rust syntax: i32, u8, u32, bool, usize, isize, void,
+// *mut T, *const T, &T, &mut T, [T; N], struct Name, bare struct names.
 unsafe fn parse_type(type_out: &mut i32, is_ptr_out: &mut i32) -> bool {
     *is_ptr_out = 0;
     PARSED_STRUCT_NAME[0] = 0;
+    IS_ARRAY = false;
+    ARRAY_COUNT = 0;
 
-    // Skip storage-class and type qualifiers
-    while tok_is(TOK_STATIC) || tok_is(TOK_CONST) || tok_is(TOK_EXTERN) {
+    // *mut T or *const T
+    if tok_is(TOK_STAR) {
         lex::next();
+        if tok_is(TOK_MUT) {
+            lex::next();
+        } else if tok_is(TOK_CONST) {
+            lex::next();
+        }
+        let mut inner_type = 0i32;
+        let mut inner_ptr = 0i32;
+        parse_type(&mut inner_type, &mut inner_ptr);
+        *type_out = inner_type;
+        *is_ptr_out = 1;
+        return true;
     }
 
-    // Handle unsigned/signed/short/long qualifiers
-    if tok_is(TOK_UNSIGNED) || tok_is(TOK_SIGNED) {
+    // &T or &mut T (compiled as pointer)
+    if tok_is(TOK_AMP) {
         lex::next();
-        if tok_is(TOK_CHAR) {
-            *type_out = TYPE_CHAR;
-            lex::next();
-        } else if tok_is(TOK_SHORT) {
-            *type_out = TYPE_INT;
-            lex::next();
-        } else if tok_is(TOK_INT) {
-            *type_out = TYPE_INT;
-            lex::next();
-        } else if tok_is(TOK_LONG) {
-            *type_out = TYPE_INT;
-            lex::next();
-        } else {
-            *type_out = TYPE_INT;
-        }
-    } else if tok_is(TOK_SHORT) {
-        *type_out = TYPE_INT;
-        lex::next();
-        if tok_is(TOK_INT) {
+        if tok_is(TOK_MUT) {
             lex::next();
         }
-    } else if tok_is(TOK_LONG) {
-        *type_out = TYPE_INT;
+        let mut inner_type = 0i32;
+        let mut inner_ptr = 0i32;
+        parse_type(&mut inner_type, &mut inner_ptr);
+        *type_out = inner_type;
+        *is_ptr_out = 1;
+        return true;
+    }
+
+    // [T; N] array
+    if tok_is(TOK_LBRACKET) {
         lex::next();
-        if tok_is(TOK_INT) {
-            lex::next();
+        let mut elem_type = 0i32;
+        let mut elem_is_ptr = 0i32;
+        parse_type(&mut elem_type, &mut elem_is_ptr);
+        lex::expect(TOK_SEMI);
+        if !tok_is(TOK_NUM) {
+            rc_error(b"expected array size\0");
+            return false;
         }
-    } else if tok_is(TOK_INT) {
-        *type_out = TYPE_INT;
+        ARRAY_COUNT = (*lex::peek()).num_val;
         lex::next();
-    } else if tok_is(TOK_CHAR) {
+        lex::expect(TOK_RBRACKET);
+        IS_ARRAY = true;
+        *type_out = elem_type;
+        *is_ptr_out = 1; // arrays are pointer-like
+        return true;
+    }
+
+    // i32, u32, usize, isize -> TYPE_INT
+    if tok_is(TOK_I32) || tok_is(TOK_U32) || tok_is(TOK_USIZE) || tok_is(TOK_ISIZE) {
+        lex::next();
+        *type_out = TYPE_INT;
+        *is_ptr_out = 0;
+        return true;
+    }
+
+    // u8, bool -> TYPE_CHAR
+    if tok_is(TOK_U8) || tok_is(TOK_BOOL) {
+        lex::next();
         *type_out = TYPE_CHAR;
+        *is_ptr_out = 0;
+        return true;
+    }
+
+    // void
+    if tok_is(TOK_VOID) {
         lex::next();
-    } else if tok_is(TOK_VOID) {
         *type_out = TYPE_VOID;
+        *is_ptr_out = 0;
+        return true;
+    }
+
+    // struct Name (explicit 'struct' keyword — still supported)
+    if tok_is(TOK_STRUCT) {
         lex::next();
-    } else if tok_is(TOK_STRUCT) {
-        lex::next(); // consume 'struct'
         if tok_is(TOK_IDENT) {
             string::strncpy(PARSED_STRUCT_NAME.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
             PARSED_STRUCT_NAME[31] = 0;
-            lex::next(); // consume struct name
+            lex::next();
         } else {
-            cc_error(b"expected struct name\0");
+            rc_error(b"expected struct name\0");
             return false;
         }
-        *type_out = TYPE_INT; // struct vars treated as int-type for storage
-    } else if tok_is(TOK_IDENT) {
+        *type_out = TYPE_INT;
+        *is_ptr_out = 0;
+        return true;
+    }
+
+    // Identifier: check typedef table first, then struct def table
+    if tok_is(TOK_IDENT) {
         // Check typedef table
         let td = find_typedef((*lex::peek()).str_val.as_ptr());
         if !td.is_null() {
             *type_out = (*td).td_type;
             *is_ptr_out = (*td).is_ptr;
             lex::next();
-        } else {
-            return false; // not a type
+            return true;
         }
-    } else {
-        return false;
+        // Check struct def table (Rust uses struct names without 'struct' keyword)
+        let sdef = sym::struct_def_lookup((*lex::peek()).str_val.as_ptr());
+        if !sdef.is_null() {
+            string::strncpy(PARSED_STRUCT_NAME.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+            PARSED_STRUCT_NAME[31] = 0;
+            lex::next();
+            *type_out = TYPE_INT;
+            *is_ptr_out = 0;
+            return true;
+        }
+        return false; // not a type
     }
 
-    while tok_is(TOK_STAR) {
-        *is_ptr_out = 1;
-        lex::next();
-    }
-    true
-}
-
-// Check whether current token begins a type specifier
-unsafe fn is_type_token() -> bool {
-    if tok_is(TOK_INT)
-        || tok_is(TOK_CHAR)
-        || tok_is(TOK_VOID)
-        || tok_is(TOK_STRUCT)
-        || tok_is(TOK_STATIC)
-        || tok_is(TOK_CONST)
-        || tok_is(TOK_EXTERN)
-        || tok_is(TOK_UNSIGNED)
-        || tok_is(TOK_SIGNED)
-        || tok_is(TOK_SHORT)
-        || tok_is(TOK_LONG)
-        || tok_is(TOK_TYPEDEF)
-    {
-        return true;
-    }
-    // Check if current identifier is a known typedef
-    if tok_is(TOK_IDENT) && !find_typedef((*lex::peek()).str_val.as_ptr()).is_null() {
-        return true;
-    }
     false
 }
 
@@ -592,7 +618,7 @@ unsafe fn parse_expr() {
                 let mut fname = [0u8; 32];
                 lex::next(); // consume '.'
                 if !tok_is(TOK_IDENT) {
-                    cc_error(b"expected field name after '.'\0");
+                    rc_error(b"expected field name after '.'\0");
                     return;
                 }
                 string::strncpy(fname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
@@ -600,7 +626,7 @@ unsafe fn parse_expr() {
                 lex::next();
                 let fld = sym::struct_field_lookup(sdef, fname.as_ptr());
                 if fld.is_null() {
-                    cc_error(b"unknown struct field\0");
+                    rc_error(b"unknown struct field\0");
                     return;
                 }
                 // Get address of struct variable
@@ -643,7 +669,7 @@ unsafe fn parse_expr() {
                 let mut fname = [0u8; 32];
                 lex::next(); // consume '->'
                 if !tok_is(TOK_IDENT) {
-                    cc_error(b"expected field name after '->'\0");
+                    rc_error(b"expected field name after '->'\0");
                     return;
                 }
                 string::strncpy(fname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
@@ -651,7 +677,7 @@ unsafe fn parse_expr() {
                 lex::next();
                 let fld = sym::struct_field_lookup(sdef, fname.as_ptr());
                 if fld.is_null() {
-                    cc_error(b"unknown struct field\0");
+                    rc_error(b"unknown struct field\0");
                     return;
                 }
                 // Load pointer value
@@ -776,40 +802,6 @@ unsafe fn parse_expr() {
                 return;
             }
 
-            // ident++ / ident-- (post-increment / post-decrement)
-            if tok_is(TOK_INC) {
-                let step: u32 = if (*s).is_ptr != 0 {
-                    if (*s).sym_type == TYPE_CHAR { 1 } else { 4 }
-                } else {
-                    1
-                };
-                lex::next();
-                emit_load_sym(s);
-                emit::push_reg(REG_EAX);
-                emit::mov_reg_imm(REG_ECX, step);
-                emit::add(REG_EAX, REG_ECX);
-                emit_store_sym(s);
-                emit::pop_reg(REG_EAX); // return old value
-                parse_binops();
-                return;
-            }
-            if tok_is(TOK_DEC) {
-                let step: u32 = if (*s).is_ptr != 0 {
-                    if (*s).sym_type == TYPE_CHAR { 1 } else { 4 }
-                } else {
-                    1
-                };
-                lex::next();
-                emit_load_sym(s);
-                emit::push_reg(REG_EAX);
-                emit::mov_reg_imm(REG_ECX, step);
-                emit::sub(REG_EAX, REG_ECX);
-                emit_store_sym(s);
-                emit::pop_reg(REG_EAX);
-                parse_binops();
-                return;
-            }
-
             // Just a plain identifier -- load and continue to binary ops
             emit_load_sym(s);
             parse_binops();
@@ -826,7 +818,7 @@ unsafe fn parse_expr() {
         }
 
         // Truly undefined
-        cc_error(b"undefined symbol\0");
+        rc_error(b"undefined symbol\0");
         emit::mov_reg_imm(REG_EAX, 0);
         parse_binops();
         return;
@@ -834,18 +826,6 @@ unsafe fn parse_expr() {
 
     // Not an ident -- use normal precedence chain
     parse_or();
-    // Check for ternary after parse_or
-    if tok_is(TOK_QUESTION) {
-        lex::next();
-        emit::cmp_eax_imm(0);
-        let false_jump = emit::jcc_placeholder(CC_E);
-        parse_expr();
-        lex::expect(TOK_COLON);
-        let end_jump = emit::jmp_placeholder();
-        emit::patch_dword(false_jump, emit::pos() - (false_jump + 4));
-        parse_or();
-        emit::patch_dword(end_jump, emit::pos() - (end_jump + 4));
-    }
 }
 
 // Binary operator continuation after primary/prefix parsing
@@ -853,20 +833,6 @@ unsafe fn parse_binops() {
     loop {
         if HAD_ERROR {
             return;
-        }
-
-        // Ternary: cond ? true_expr : false_expr
-        if tok_is(TOK_QUESTION) {
-            lex::next();
-            emit::cmp_eax_imm(0);
-            let false_jump = emit::jcc_placeholder(CC_E);
-            parse_expr();
-            lex::expect(TOK_COLON);
-            let end_jump = emit::jmp_placeholder();
-            emit::patch_dword(false_jump, emit::pos() - (false_jump + 4));
-            parse_or();
-            emit::patch_dword(end_jump, emit::pos() - (end_jump + 4));
-            continue;
         }
 
         // Logical OR
@@ -1233,7 +1199,9 @@ unsafe fn parse_mul() {
     }
 }
 
-// Unary prefix: - ! ~ * & ++ -- (type)expr
+// Unary prefix: - ! * &
+// ! is now bitwise NOT (Rust semantics)
+// Removed: ~ (no tilde in Rust), ++ and -- (use += 1, -= 1)
 unsafe fn parse_unary() {
     if HAD_ERROR {
         return;
@@ -1246,17 +1214,8 @@ unsafe fn parse_unary() {
         emit::neg(REG_EAX);
         return;
     }
-    // Logical NOT: !expr
+    // Bitwise NOT: !expr (Rust semantics: !0 = -1)
     if tok_is(TOK_BANG) {
-        lex::next();
-        parse_unary();
-        emit::cmp_eax_imm(0);
-        emit::setcc(CC_E, REG_EAX);
-        emit::movzx_eax_al();
-        return;
-    }
-    // Bitwise NOT: ~expr
-    if tok_is(TOK_TILDE) {
         lex::next();
         parse_unary();
         emit::not(REG_EAX);
@@ -1277,13 +1236,17 @@ unsafe fn parse_unary() {
     // Address-of: &ident
     if tok_is(TOK_AMP) {
         lex::next();
+        // skip optional 'mut' after & in expressions (e.g. &mut x)
+        if tok_is(TOK_MUT) {
+            lex::next();
+        }
         if !tok_is(TOK_IDENT) {
-            cc_error(b"expected identifier after '&'\0");
+            rc_error(b"expected identifier after '&'\0");
             return;
         }
         let s = sym::lookup((*lex::peek()).str_val.as_ptr());
         if s.is_null() {
-            cc_error(b"undefined variable\0");
+            rc_error(b"undefined variable\0");
             lex::next();
             return;
         }
@@ -1297,61 +1260,11 @@ unsafe fn parse_unary() {
         }
         return;
     }
-    // Pre-increment: ++ident
-    if tok_is(TOK_INC) {
-        lex::next();
-        if !tok_is(TOK_IDENT) {
-            cc_error(b"expected ident after '++'\0");
-            return;
-        }
-        let s = sym::lookup((*lex::peek()).str_val.as_ptr());
-        if s.is_null() {
-            cc_error(b"undefined variable\0");
-            lex::next();
-            return;
-        }
-        lex::next();
-        let step: u32 = if (*s).is_ptr != 0 {
-            if (*s).sym_type == TYPE_CHAR { 1 } else { 4 }
-        } else {
-            1
-        };
-        emit_load_sym(s);
-        emit::mov_reg_imm(REG_ECX, step);
-        emit::add(REG_EAX, REG_ECX);
-        emit_store_sym(s);
-        return;
-    }
-    // Pre-decrement: --ident
-    if tok_is(TOK_DEC) {
-        lex::next();
-        if !tok_is(TOK_IDENT) {
-            cc_error(b"expected ident after '--'\0");
-            return;
-        }
-        let s = sym::lookup((*lex::peek()).str_val.as_ptr());
-        if s.is_null() {
-            cc_error(b"undefined variable\0");
-            lex::next();
-            return;
-        }
-        lex::next();
-        let step: u32 = if (*s).is_ptr != 0 {
-            if (*s).sym_type == TYPE_CHAR { 1 } else { 4 }
-        } else {
-            1
-        };
-        emit_load_sym(s);
-        emit::mov_reg_imm(REG_ECX, step);
-        emit::sub(REG_EAX, REG_ECX);
-        emit_store_sym(s);
-        return;
-    }
 
     parse_postfix();
 }
 
-// Postfix: array indexing, struct member access after a primary
+// Postfix: array indexing, struct member access, `as` cast
 unsafe fn parse_postfix() {
     if HAD_ERROR {
         return;
@@ -1391,7 +1304,7 @@ unsafe fn parse_postfix() {
             let mut fname = [0u8; 32];
             lex::next(); // consume '->'
             if !tok_is(TOK_IDENT) {
-                cc_error(b"expected field name after '->'\0");
+                rc_error(b"expected field name after '->'\0");
                 return;
             }
             string::strncpy(fname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
@@ -1399,7 +1312,7 @@ unsafe fn parse_postfix() {
             lex::next();
             let fld = sym::struct_field_lookup(sdef, fname.as_ptr());
             if fld.is_null() {
-                cc_error(b"unknown struct field\0");
+                rc_error(b"unknown struct field\0");
                 return;
             }
             // EAX already has the pointer value
@@ -1424,7 +1337,7 @@ unsafe fn parse_postfix() {
             let mut fname = [0u8; 32];
             lex::next(); // consume '.'
             if !tok_is(TOK_IDENT) {
-                cc_error(b"expected field name after '.'\0");
+                rc_error(b"expected field name after '.'\0");
                 return;
             }
             string::strncpy(fname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
@@ -1432,7 +1345,7 @@ unsafe fn parse_postfix() {
             lex::next();
             let fld = sym::struct_field_lookup(sdef, fname.as_ptr());
             if fld.is_null() {
-                cc_error(b"unknown struct field\0");
+                rc_error(b"unknown struct field\0");
                 return;
             }
             // Re-compute struct address
@@ -1457,11 +1370,26 @@ unsafe fn parse_postfix() {
             continue;
         }
 
+        // `as` cast: expr as Type
+        if tok_is(TOK_AS) {
+            lex::next();
+            let mut cast_type = 0i32;
+            let mut cast_is_ptr = 0i32;
+            parse_type(&mut cast_type, &mut cast_is_ptr);
+            // No code emitted -- same-size 32-bit values
+            if cast_is_ptr != 0 {
+                EXPR_PTR_SCALE = if cast_type == TYPE_CHAR { 1 } else { 4 };
+            } else {
+                EXPR_PTR_SCALE = 0;
+            }
+            continue;
+        }
+
         break;
     }
 }
 
-// Primary: literals, identifiers, function calls, grouped expressions
+// Primary: literals, identifiers, function calls, grouped expressions, true/false
 unsafe fn parse_primary() {
     if HAD_ERROR {
         return;
@@ -1470,6 +1398,24 @@ unsafe fn parse_primary() {
     // Number literal
     if tok_is(TOK_NUM) {
         emit::mov_reg_imm(REG_EAX, (*lex::peek()).num_val as u32);
+        EXPR_PTR_SCALE = 0;
+        EXPR_STRUCT_NAME[0] = 0;
+        lex::next();
+        return;
+    }
+
+    // true -> 1
+    if tok_is(TOK_TRUE) {
+        emit::mov_reg_imm(REG_EAX, 1);
+        EXPR_PTR_SCALE = 0;
+        EXPR_STRUCT_NAME[0] = 0;
+        lex::next();
+        return;
+    }
+
+    // false -> 0
+    if tok_is(TOK_FALSE) {
+        emit::mov_reg_imm(REG_EAX, 0);
         EXPR_PTR_SCALE = 0;
         EXPR_STRUCT_NAME[0] = 0;
         lex::next();
@@ -1504,60 +1450,31 @@ unsafe fn parse_primary() {
             return;
         }
 
-        // Post-increment / post-decrement
-        if tok_is(TOK_INC) && !s.is_null() {
-            lex::next();
-            emit_load_sym(s);
-            emit::push_reg(REG_EAX);
-            emit::mov_reg_imm(REG_ECX, 1);
-            emit::add(REG_EAX, REG_ECX);
-            emit_store_sym(s);
-            emit::pop_reg(REG_EAX);
-            return;
-        }
-        if tok_is(TOK_DEC) && !s.is_null() {
-            lex::next();
-            emit_load_sym(s);
-            emit::push_reg(REG_EAX);
-            emit::mov_reg_imm(REG_ECX, 1);
-            emit::sub(REG_EAX, REG_ECX);
-            emit_store_sym(s);
-            emit::pop_reg(REG_EAX);
-            return;
-        }
-
         // Simple variable load
         if !s.is_null() {
             emit_load_sym(s);
         } else {
-            cc_error(b"undefined symbol\0");
+            rc_error(b"undefined symbol\0");
             emit::mov_reg_imm(REG_EAX, 0);
         }
         return;
     }
 
-    // Grouped expression or cast: ( expr ) or ( type ) expr
+    // Grouped expression: ( expr )
     if tok_is(TOK_LPAREN) {
         lex::next();
-        if is_type_token() {
-            let mut ct = 0i32;
-            let mut cp = 0i32;
-            parse_type(&mut ct, &mut cp);
-            lex::expect(TOK_RPAREN);
-            parse_unary();
-            return;
-        }
         parse_expr();
         lex::expect(TOK_RPAREN);
         return;
     }
 
-    cc_error(b"expected expression\0");
+    rc_error(b"expected expression\0");
 }
 
 // ---- Enum parsing ----
 
-// Parse an enum declaration: enum [name] { IDENT [= val], ... };
+// Parse an enum declaration: enum [Name] { IDENT [= val], ... }
+// No trailing semicolon (Rust syntax).
 unsafe fn parse_enum() {
     let mut value: i32 = 0;
 
@@ -1574,7 +1491,7 @@ unsafe fn parse_enum() {
         let mut name = [0u8; 32];
 
         if !tok_is(TOK_IDENT) {
-            cc_error(b"expected enum constant name\0");
+            rc_error(b"expected enum constant name\0");
             break;
         }
         string::strncpy(name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
@@ -1585,7 +1502,7 @@ unsafe fn parse_enum() {
         if tok_is(TOK_ASSIGN) {
             lex::next();
             if !tok_is(TOK_NUM) {
-                cc_error(b"expected integer value\0");
+                rc_error(b"expected integer value\0");
                 break;
             }
             value = (*lex::peek()).num_val;
@@ -1603,105 +1520,277 @@ unsafe fn parse_enum() {
     }
 
     lex::expect(TOK_RBRACE);
-    lex::expect(TOK_SEMI);
+    // No trailing semicolon for enum in Rust syntax
 }
 
-// ---- Switch/case ----
+// ---- Match ----
 
-unsafe fn parse_switch() {
+// Parse a match expression: match expr { val => { ... }, _ => { ... } }
+// Uses a LOCAL break-patch array, NOT the loop stack.
+unsafe fn parse_match() {
     let old_local_offset = LOCAL_OFFSET;
 
-    lex::next(); // consume 'switch'
-    lex::expect(TOK_LPAREN);
+    lex::next(); // consume 'match'
     parse_expr(); // result in EAX
-    lex::expect(TOK_RPAREN);
 
-    // Allocate a temporary local for the switch value
+    // Allocate a temporary local for the match value
     LOCAL_OFFSET -= 4;
-    let switch_local = LOCAL_OFFSET;
-    emit::store_local(switch_local, REG_EAX);
+    let match_local = LOCAL_OFFSET;
+    emit::store_local(match_local, REG_EAX);
 
     lex::expect(TOK_LBRACE);
 
-    // Push a context for break (reuse loop_stack; continue_target=0)
-    loop_push(0);
+    // Local break-patch collection (NOT loop stack)
+    let mut break_patches = [0u32; 32];
+    let mut break_count = 0usize;
+    let mut next_arm_jump: u32 = 0;
 
     while !tok_is(TOK_RBRACE) && !tok_is(TOK_EOF) && !HAD_ERROR {
-        if tok_is(TOK_CASE) {
-            let mut is_neg = false;
-            lex::next(); // consume 'case'
+        // Patch previous arm's skip-jump to here
+        if next_arm_jump != 0 {
+            emit::patch_dword(next_arm_jump, emit::pos() - (next_arm_jump + 4));
+            next_arm_jump = 0;
+        }
 
-            // Parse case value: optional minus, then integer or enum constant
-            if tok_is(TOK_MINUS) {
-                is_neg = true;
-                lex::next();
-            }
-            let mut case_val: i32;
-            if tok_is(TOK_NUM) {
-                case_val = (*lex::peek()).num_val;
-                lex::next();
-            } else if tok_is(TOK_IDENT) {
-                let cs = sym::lookup((*lex::peek()).str_val.as_ptr());
-                if !cs.is_null() && (*cs).kind == SYM_CONST {
-                    case_val = (*cs).addr as i32;
-                } else {
-                    cc_error(b"expected constant in case\0");
-                    break;
-                }
-                lex::next();
+        if tok_is(TOK_UNDERSCORE_PAT) {
+            // _ => default arm
+            lex::next();
+            lex::expect(TOK_FAT_ARROW);
+            // Parse body: block or single statement
+            if tok_is(TOK_LBRACE) {
+                parse_block();
             } else {
-                cc_error(b"expected constant in case\0");
-                break;
-            }
-            if is_neg {
-                case_val = -case_val;
-            }
-
-            lex::expect(TOK_COLON);
-
-            // cmp [switch_local], case_val; jne skip
-            emit::load_local(REG_EAX, switch_local);
-            emit::cmp_eax_imm(case_val);
-            let skip = emit::jcc_placeholder(CC_NE);
-
-            // Parse the case body until next case/default/rbrace
-            while !tok_is(TOK_CASE)
-                && !tok_is(TOK_DEFAULT)
-                && !tok_is(TOK_RBRACE)
-                && !tok_is(TOK_EOF)
-                && !HAD_ERROR
-            {
                 parse_stmt();
             }
-
-            // Backpatch skip
-            emit::patch_dword(skip, emit::pos() - (skip + 4));
-        } else if tok_is(TOK_DEFAULT) {
-            lex::next(); // consume 'default'
-            lex::expect(TOK_COLON);
-
-            // Parse default body
-            while !tok_is(TOK_CASE)
-                && !tok_is(TOK_DEFAULT)
-                && !tok_is(TOK_RBRACE)
-                && !tok_is(TOK_EOF)
-                && !HAD_ERROR
-            {
-                parse_stmt();
+            if tok_is(TOK_COMMA) {
+                lex::next();
+            }
+            // Jump to end
+            if break_count < 32 {
+                break_patches[break_count] = emit::jmp_placeholder();
+                break_count += 1;
             }
         } else {
-            // Unexpected token inside switch body
-            parse_stmt();
+            // Pattern value => { ... }
+            parse_expr(); // pattern value -> EAX
+            emit::load_local(REG_ECX, match_local);
+            emit::cmp(REG_ECX, REG_EAX);
+            next_arm_jump = emit::jcc_placeholder(CC_NE);
+            lex::expect(TOK_FAT_ARROW);
+            // Parse body
+            if tok_is(TOK_LBRACE) {
+                parse_block();
+            } else {
+                parse_stmt();
+            }
+            if tok_is(TOK_COMMA) {
+                lex::next();
+            }
+            // Jump to end
+            if break_count < 32 {
+                break_patches[break_count] = emit::jmp_placeholder();
+                break_count += 1;
+            }
         }
     }
 
-    // Patch all break jumps to here
-    loop_pop();
-
     lex::expect(TOK_RBRACE);
+
+    // Patch the last arm's skip-jump if it was never patched
+    if next_arm_jump != 0 {
+        emit::patch_dword(next_arm_jump, emit::pos() - (next_arm_jump + 4));
+    }
+
+    // Patch all break jumps to here
+    for i in 0..break_count {
+        emit::patch_dword(break_patches[i], emit::pos() - (break_patches[i] + 4));
+    }
 
     // Reclaim temporary local
     LOCAL_OFFSET = old_local_offset;
+}
+
+// ---- loop { } ----
+
+unsafe fn parse_loop() {
+    lex::next(); // consume 'loop'
+    let loop_start = emit::pos();
+    loop_push(loop_start);
+    parse_block();
+    emit::jmp_rel((loop_start as i32) - (emit::pos() as i32 + 5));
+    loop_pop();
+}
+
+// ---- for i in start..end { } ----
+
+unsafe fn parse_for() {
+    lex::next(); // consume 'for'
+    sym::enter_scope();
+
+    // Iterator variable name
+    if !tok_is(TOK_IDENT) {
+        rc_error(b"expected iterator variable\0");
+        return;
+    }
+    let mut iter_name = [0u8; 32];
+    string::strncpy(iter_name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+    iter_name[31] = 0;
+    lex::next();
+
+    lex::expect(TOK_IN);
+
+    // Parse start expression
+    parse_expr(); // start -> EAX
+    LOCAL_OFFSET -= 4;
+    let iter_off = LOCAL_OFFSET;
+    sym::add(iter_name.as_ptr(), SYM_LOCAL, TYPE_INT, 0, iter_off, 0);
+    // Mark iterator as mutable
+    let iter_sym = sym::lookup(iter_name.as_ptr());
+    if !iter_sym.is_null() {
+        (*iter_sym).is_mutable = 1;
+    }
+    emit::store_local(iter_off, REG_EAX);
+
+    lex::expect(TOK_DOUBLE_DOT);
+
+    // Parse end expression
+    parse_expr(); // end -> EAX
+    LOCAL_OFFSET -= 4;
+    let end_off = LOCAL_OFFSET;
+    emit::store_local(end_off, REG_EAX);
+
+    // Condition: iter < end
+    let cond_start = emit::pos();
+    emit::load_local(REG_EAX, iter_off);
+    // Save EAX, load end into ECX
+    emit::push_reg(REG_EAX);
+    emit::load_local(REG_EAX, end_off);
+    emit::mov_reg_reg(REG_ECX, REG_EAX);
+    emit::pop_reg(REG_EAX);
+    emit::cmp(REG_EAX, REG_ECX);
+    let exit_jump = emit::jcc_placeholder(CC_GE);
+
+    // Skip over update code (jump to body)
+    let skip_update = emit::jmp_placeholder();
+
+    // Update code (increment iterator)
+    let update_start = emit::pos();
+    emit::load_local(REG_EAX, iter_off);
+    emit::mov_reg_imm(REG_ECX, 1);
+    emit::add(REG_EAX, REG_ECX);
+    emit::store_local(iter_off, REG_EAX);
+    emit::jmp_rel((cond_start as i32) - (emit::pos() as i32 + 5));
+
+    // Body starts here
+    emit::patch_dword(skip_update, emit::pos() - (skip_update + 4));
+    loop_push(update_start); // continue -> increment
+    parse_block();
+    emit::jmp_rel((update_start as i32) - (emit::pos() as i32 + 5));
+
+    // Patch exit
+    emit::patch_dword(exit_jump, emit::pos() - (exit_jump + 4));
+    loop_pop();
+    sym::leave_scope();
+}
+
+// ---- let binding ----
+
+unsafe fn parse_let() {
+    lex::next(); // consume 'let'
+
+    let is_mut = if tok_is(TOK_MUT) {
+        lex::next();
+        true
+    } else {
+        false
+    };
+
+    if !tok_is(TOK_IDENT) {
+        rc_error(b"expected variable name\0");
+        return;
+    }
+    let mut vname = [0u8; 32];
+    string::strncpy(vname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+    vname[31] = 0;
+    lex::next();
+
+    lex::expect(TOK_COLON);
+
+    let mut vtype = 0i32;
+    let mut vptr = 0i32;
+    if !parse_type(&mut vtype, &mut vptr) {
+        rc_error(b"expected type\0");
+        return;
+    }
+
+    let mut local_sname = [0u8; 32];
+    string::strncpy(local_sname.as_mut_ptr(), PARSED_STRUCT_NAME.as_ptr(), 31);
+    local_sname[31] = 0;
+
+    if IS_ARRAY {
+        // Array: [T; N]
+        let elem_sz = if vtype == TYPE_CHAR { 1 } else { 4 };
+        let mut total = ARRAY_COUNT * elem_sz;
+        total = (total + 3) & !3; // align to 4
+        LOCAL_OFFSET -= total;
+        sym::add(vname.as_ptr(), SYM_LOCAL, vtype, 1, LOCAL_OFFSET, 0);
+        // Set is_mutable
+        let sym_p = sym::lookup(vname.as_ptr());
+        if !sym_p.is_null() {
+            (*sym_p).is_mutable = if is_mut { 1 } else { 0 };
+        }
+
+        // Optional initializer: = [v1, v2, ...]
+        if tok_is(TOK_ASSIGN) {
+            lex::next();
+            if tok_is(TOK_LBRACKET) {
+                let mut idx = 0i32;
+                lex::next();
+                while !tok_is(TOK_RBRACKET) && !tok_is(TOK_EOF) && !HAD_ERROR {
+                    let off = LOCAL_OFFSET + idx * elem_sz;
+                    parse_expr();
+                    emit::store_local(off, REG_EAX);
+                    idx += 1;
+                    if tok_is(TOK_COMMA) {
+                        lex::next();
+                    }
+                }
+                lex::expect(TOK_RBRACKET);
+            } else {
+                rc_error(b"expected '[' for array initializer\0");
+            }
+        }
+    } else if local_sname[0] != 0 && vptr == 0 {
+        // Struct value variable: allocate def->size bytes on stack
+        let sdef = sym::struct_def_lookup(local_sname.as_ptr());
+        let sz = if !sdef.is_null() { (*sdef).size } else { 4 };
+        LOCAL_OFFSET -= sz;
+        sym::add(vname.as_ptr(), SYM_LOCAL, vtype, 0, LOCAL_OFFSET, 0);
+        set_sym_struct(vname.as_ptr(), local_sname.as_ptr());
+        let sym_p = sym::lookup(vname.as_ptr());
+        if !sym_p.is_null() {
+            (*sym_p).is_mutable = if is_mut { 1 } else { 0 };
+        }
+    } else {
+        // Regular variable
+        LOCAL_OFFSET -= 4;
+        sym::add(vname.as_ptr(), SYM_LOCAL, vtype, vptr, LOCAL_OFFSET, 0);
+        if local_sname[0] != 0 {
+            set_sym_struct(vname.as_ptr(), local_sname.as_ptr());
+        }
+        let sym_p = sym::lookup(vname.as_ptr());
+        if !sym_p.is_null() {
+            (*sym_p).is_mutable = if is_mut { 1 } else { 0 };
+        }
+
+        if tok_is(TOK_ASSIGN) {
+            lex::next();
+            parse_expr();
+            emit::store_local(LOCAL_OFFSET, REG_EAX);
+        }
+    }
+
+    lex::expect(TOK_SEMI);
 }
 
 // ---- Statement parsing ----
@@ -1729,137 +1818,55 @@ unsafe fn parse_stmt() {
         return;
     }
 
-    // if (expr) stmt [else stmt]
+    // if expr { } [else { }]  -- no parens, braces required
     if tok_is(TOK_IF) {
-        lex::next();
-        lex::expect(TOK_LPAREN);
-        parse_expr();
-        lex::expect(TOK_RPAREN);
-        emit::cmp_eax_imm(0);
-        let false_jump = emit::jcc_placeholder(CC_E);
-        parse_stmt();
-        if tok_is(TOK_ELSE) {
-            lex::next();
-            let end_jump = emit::jmp_placeholder();
-            emit::patch_dword(false_jump, emit::pos() - (false_jump + 4));
-            parse_stmt();
-            emit::patch_dword(end_jump, emit::pos() - (end_jump + 4));
-        } else {
-            emit::patch_dword(false_jump, emit::pos() - (false_jump + 4));
-        }
+        parse_if();
         return;
     }
 
-    // while (expr) stmt
+    // while expr { }  -- no parens, braces required
     if tok_is(TOK_WHILE) {
         lex::next();
         let loop_start = emit::pos();
-        loop_push(loop_start);
-        lex::expect(TOK_LPAREN);
         parse_expr();
-        lex::expect(TOK_RPAREN);
         emit::cmp_eax_imm(0);
         let exit_jump = emit::jcc_placeholder(CC_E);
-        parse_stmt();
+        loop_push(loop_start);
+        parse_block();
         emit::jmp_rel((loop_start as i32) - (emit::pos() as i32 + 5));
         emit::patch_dword(exit_jump, emit::pos() - (exit_jump + 4));
         loop_pop();
         return;
     }
 
-    // do { body } while (cond);
-    if tok_is(TOK_DO) {
-        lex::next();
-        let loop_start = emit::pos();
-        loop_push(loop_start); // temporary; patched below
-        parse_stmt();
-        let cond_start = emit::pos();
-        // Patch continue target to point to condition
-        LOOP_STACK[(LOOP_DEPTH - 1) as usize].continue_target = cond_start;
-        lex::expect(TOK_WHILE);
-        lex::expect(TOK_LPAREN);
-        parse_expr();
-        lex::expect(TOK_RPAREN);
-        emit::cmp_eax_imm(0);
-        // jne -> loop_start (loop back if condition is true)
-        emit::byte(0x0F);
-        emit::byte(0x80 | CC_NE as u8);
-        emit::dword((loop_start as i32 - (emit::pos() as i32 + 4)) as u32);
-        loop_pop();
-        lex::expect(TOK_SEMI);
+    // loop { }
+    if tok_is(TOK_LOOP) {
+        parse_loop();
         return;
     }
 
-    // for (init; cond; update) stmt
+    // for i in start..end { }
     if tok_is(TOK_FOR) {
-        lex::next();
-        lex::expect(TOK_LPAREN);
-
-        // Init
-        if !tok_is(TOK_SEMI) {
-            if is_type_token() {
-                let mut vt = 0i32;
-                let mut vp = 0i32;
-                let mut vn = [0u8; 32];
-                parse_type(&mut vt, &mut vp);
-                string::strncpy(vn.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
-                vn[31] = 0;
-                lex::next();
-                LOCAL_OFFSET -= 4;
-                sym::add(vn.as_ptr(), SYM_LOCAL, vt, vp, LOCAL_OFFSET, 0);
-                if tok_is(TOK_ASSIGN) {
-                    lex::next();
-                    parse_expr();
-                    emit::store_local(LOCAL_OFFSET, REG_EAX);
-                }
-            } else {
-                parse_expr();
-            }
-        }
-        lex::expect(TOK_SEMI);
-
-        // Condition
-        let cond_start = emit::pos();
-        if !tok_is(TOK_SEMI) {
-            parse_expr();
-        } else {
-            emit::mov_reg_imm(REG_EAX, 1);
-        }
-        lex::expect(TOK_SEMI);
-
-        emit::cmp_eax_imm(0);
-        let body_end_jump = emit::jcc_placeholder(CC_E);
-
-        // Jump over the update code (emitted next)
-        let skip_update = emit::jmp_placeholder();
-        let update_start = emit::pos();
-
-        // Update
-        if !tok_is(TOK_RPAREN) {
-            parse_expr();
-        }
-        lex::expect(TOK_RPAREN);
-
-        // After update, jump back to condition
-        emit::jmp_rel((cond_start as i32) - (emit::pos() as i32 + 5));
-
-        // Body starts here
-        emit::patch_dword(skip_update, emit::pos() - (skip_update + 4));
-        loop_push(update_start);
-        parse_stmt();
-
-        // After body, jump to update
-        emit::jmp_rel((update_start as i32) - (emit::pos() as i32 + 5));
-
-        // Patch exit
-        emit::patch_dword(body_end_jump, emit::pos() - (body_end_jump + 4));
-        loop_pop();
+        parse_for();
         return;
     }
 
-    // switch (expr) { case ...: ... }
-    if tok_is(TOK_SWITCH) {
-        parse_switch();
+    // match expr { ... }
+    if tok_is(TOK_MATCH) {
+        parse_match();
+        return;
+    }
+
+    // let [mut] name: Type [= expr];
+    if tok_is(TOK_LET) {
+        parse_let();
+        return;
+    }
+
+    // unsafe { } -- transparent, just parse the block
+    if tok_is(TOK_UNSAFE) {
+        lex::next();
+        parse_block();
         return;
     }
 
@@ -1879,7 +1886,7 @@ unsafe fn parse_stmt() {
             let target = LOOP_STACK[(LOOP_DEPTH - 1) as usize].continue_target;
             emit::jmp_rel((target as i32) - (emit::pos() as i32 + 5));
         } else {
-            cc_error(b"continue outside loop\0");
+            rc_error(b"continue outside loop\0");
         }
         lex::expect(TOK_SEMI);
         return;
@@ -1888,85 +1895,6 @@ unsafe fn parse_stmt() {
     // Enum declaration inside block
     if tok_is(TOK_ENUM) {
         parse_enum();
-        return;
-    }
-
-    // Local variable declaration
-    if is_type_token() {
-        let mut vtype = 0i32;
-        let mut vptr = 0i32;
-        let mut local_sname = [0u8; 32];
-
-        parse_type(&mut vtype, &mut vptr);
-        string::strncpy(local_sname.as_mut_ptr(), PARSED_STRUCT_NAME.as_ptr(), 31);
-        local_sname[31] = 0;
-
-        loop {
-            if HAD_ERROR {
-                return;
-            }
-            let mut vname = [0u8; 32];
-            string::strncpy(vname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
-            vname[31] = 0;
-            lex::next();
-
-            // Array: type arr[N]; or type arr[N] = {v1, v2, ...};
-            if tok_is(TOK_LBRACKET) {
-                lex::next();
-                let arr_size = (*lex::peek()).num_val;
-                lex::next();
-                lex::expect(TOK_RBRACKET);
-                let elem_sz = if vtype == TYPE_CHAR { 1 } else { 4 };
-                let mut total = arr_size * elem_sz;
-                total = (total + 3) & !3; // align to 4
-                LOCAL_OFFSET -= total;
-                sym::add(vname.as_ptr(), SYM_LOCAL, vtype, 1, LOCAL_OFFSET, 0);
-                // Array initializer: = {v1, v2, ...}
-                if tok_is(TOK_ASSIGN) {
-                    lex::next();
-                    if tok_is(TOK_LBRACE) {
-                        let mut idx = 0i32;
-                        lex::next();
-                        while !tok_is(TOK_RBRACE) && !tok_is(TOK_EOF) && !HAD_ERROR {
-                            let off = LOCAL_OFFSET + idx * elem_sz;
-                            parse_expr();
-                            emit::store_local(off, REG_EAX);
-                            idx += 1;
-                            if tok_is(TOK_COMMA) {
-                                lex::next();
-                            }
-                        }
-                        lex::expect(TOK_RBRACE);
-                    } else {
-                        cc_error(b"expected '{' for array initializer\0");
-                    }
-                }
-            } else if local_sname[0] != 0 && vptr == 0 {
-                // Struct value variable: allocate def->size bytes on stack
-                let sdef = sym::struct_def_lookup(local_sname.as_ptr());
-                let sz = if !sdef.is_null() { (*sdef).size } else { 4 };
-                LOCAL_OFFSET -= sz;
-                sym::add(vname.as_ptr(), SYM_LOCAL, vtype, 0, LOCAL_OFFSET, 0);
-                set_sym_struct(vname.as_ptr(), local_sname.as_ptr());
-            } else {
-                LOCAL_OFFSET -= 4;
-                sym::add(vname.as_ptr(), SYM_LOCAL, vtype, vptr, LOCAL_OFFSET, 0);
-                if local_sname[0] != 0 {
-                    set_sym_struct(vname.as_ptr(), local_sname.as_ptr());
-                }
-                if tok_is(TOK_ASSIGN) {
-                    lex::next();
-                    parse_expr();
-                    emit::store_local(LOCAL_OFFSET, REG_EAX);
-                }
-            }
-            if tok_is(TOK_COMMA) {
-                lex::next();
-                continue;
-            }
-            break;
-        }
-        lex::expect(TOK_SEMI);
         return;
     }
 
@@ -1979,6 +1907,28 @@ unsafe fn parse_stmt() {
     // Expression statement
     parse_expr();
     lex::expect(TOK_SEMI);
+}
+
+// Parse if: no parens, braces required, else if chaining
+unsafe fn parse_if() {
+    lex::next(); // consume 'if'
+    parse_expr();
+    emit::cmp_eax_imm(0);
+    let false_jump = emit::jcc_placeholder(CC_E);
+    parse_block(); // braces required
+    if tok_is(TOK_ELSE) {
+        lex::next();
+        let end_jump = emit::jmp_placeholder();
+        emit::patch_dword(false_jump, emit::pos() - (false_jump + 4));
+        if tok_is(TOK_IF) {
+            parse_if(); // else if
+        } else {
+            parse_block();
+        }
+        emit::patch_dword(end_jump, emit::pos() - (end_jump + 4));
+    } else {
+        emit::patch_dword(false_jump, emit::pos() - (false_jump + 4));
+    }
 }
 
 // Parse a brace-enclosed block
@@ -2003,100 +1953,85 @@ fn global_data_base() -> u32 {
 
 static mut GLOBAL_OFFSET: u32 = 0;
 
-// Parse a function definition
-unsafe fn parse_function(fn_type: i32, is_ptr: i32, name: *const u8) {
+// Parse a function definition: fn name(param: Type, ...) [-> RetType] { body }
+unsafe fn parse_function() {
+    lex::next(); // consume 'fn'
+
+    if !tok_is(TOK_IDENT) {
+        rc_error(b"expected function name\0");
+        return;
+    }
+    let mut name = [0u8; 32];
+    string::strncpy(name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+    name[31] = 0;
+    lex::next();
+
     let func_start = emit::pos();
-    sym::add(name, SYM_FUNC, fn_type, is_ptr, func_start as i32, 0);
+
+    // Add function to symbol table BEFORE entering scope
+    // (so it's at scope 0 and survives leave_scope at end)
+    // We'll set the return type to void initially, then update after parsing ->
+    sym::add(name.as_ptr(), SYM_FUNC, TYPE_VOID, 0, func_start as i32, 0);
+
+    lex::expect(TOK_LPAREN);
     sym::enter_scope();
 
-    // Parameters
-    lex::expect(TOK_LPAREN);
+    // Parameters: name: Type, name: Type, ...
     let mut param_count: i32 = 0;
 
-    if !tok_is(TOK_RPAREN) {
-        if tok_is(TOK_VOID) {
+    while !tok_is(TOK_RPAREN) && !tok_is(TOK_EOF) && !HAD_ERROR {
+        if !tok_is(TOK_IDENT) {
+            rc_error(b"expected parameter name\0");
+            break;
+        }
+        let mut pname = [0u8; 32];
+        string::strncpy(pname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+        pname[31] = 0;
+        lex::next();
+
+        lex::expect(TOK_COLON);
+
+        let mut ptype = 0i32;
+        let mut pis_ptr = 0i32;
+        if !parse_type(&mut ptype, &mut pis_ptr) {
+            rc_error(b"expected parameter type\0");
+            break;
+        }
+
+        let offset = 8 + param_count * 4;
+        sym::add(pname.as_ptr(), SYM_PARAM, ptype, pis_ptr, offset, 0);
+
+        // All params are mutable in v1
+        let psym = sym::lookup(pname.as_ptr());
+        if !psym.is_null() {
+            (*psym).is_mutable = 1;
+        }
+
+        // Copy struct_name if struct type
+        if PARSED_STRUCT_NAME[0] != 0 {
+            set_sym_struct(pname.as_ptr(), PARSED_STRUCT_NAME.as_ptr());
+        }
+
+        param_count += 1;
+        if tok_is(TOK_COMMA) {
             lex::next();
-            if tok_is(TOK_RPAREN) {
-                // void parameter list -- no params
-            } else {
-                // void *name
-                let mut pp = 0i32;
-                while tok_is(TOK_STAR) {
-                    pp = 1;
-                    lex::next();
-                }
-                if tok_is(TOK_IDENT) {
-                    param_count += 1;
-                    sym::add(
-                        (*lex::peek()).str_val.as_ptr(),
-                        SYM_PARAM,
-                        TYPE_VOID,
-                        pp,
-                        8 + (param_count - 1) * 4,
-                        0,
-                    );
-                    lex::next();
-                }
-                // Continue parsing remaining params after void *
-                while tok_is(TOK_COMMA) {
-                    let mut pt = 0i32;
-                    let mut pp2 = 0i32;
-                    let mut pn = [0u8; 32];
-                    lex::next();
-                    if !parse_type(&mut pt, &mut pp2) {
-                        cc_error(b"expected parameter type\0");
-                        break;
-                    }
-                    if tok_is(TOK_IDENT) {
-                        string::strncpy(
-                            pn.as_mut_ptr(),
-                            (*lex::peek()).str_val.as_ptr(),
-                            31,
-                        );
-                        pn[31] = 0;
-                        param_count += 1;
-                        sym::add(pn.as_ptr(), SYM_PARAM, pt, pp2, 8 + (param_count - 1) * 4, 0);
-                        if PARSED_STRUCT_NAME[0] != 0 {
-                            set_sym_struct(pn.as_ptr(), PARSED_STRUCT_NAME.as_ptr());
-                        }
-                        lex::next();
-                    }
-                }
-            }
-        } else {
-            loop {
-                let mut pt = 0i32;
-                let mut pp = 0i32;
-                let mut pn = [0u8; 32];
-                if !parse_type(&mut pt, &mut pp) {
-                    cc_error(b"expected parameter type\0");
-                    break;
-                }
-                if tok_is(TOK_IDENT) {
-                    string::strncpy(pn.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
-                    pn[31] = 0;
-                    param_count += 1;
-                    sym::add(pn.as_ptr(), SYM_PARAM, pt, pp, 8 + (param_count - 1) * 4, 0);
-                    if PARSED_STRUCT_NAME[0] != 0 {
-                        set_sym_struct(pn.as_ptr(), PARSED_STRUCT_NAME.as_ptr());
-                    }
-                    lex::next();
-                }
-                if !tok_is(TOK_COMMA) {
-                    break;
-                }
-                lex::next();
-            }
         }
     }
-
     lex::expect(TOK_RPAREN);
 
-    // Function prototype (declaration without body): skip it
-    if tok_is(TOK_SEMI) {
+    // Return type
+    let mut ret_type = TYPE_VOID;
+    let mut ret_is_ptr = 0i32;
+    if tok_is(TOK_ARROW) {
         lex::next();
-        sym::leave_scope();
-        return;
+        parse_type(&mut ret_type, &mut ret_is_ptr);
+    }
+
+    // Update function's return type now that we've parsed it
+    let fsym = sym::lookup(name.as_ptr());
+    if !fsym.is_null() {
+        (*fsym).sym_type = ret_type;
+        (*fsym).is_ptr = ret_is_ptr;
     }
 
     // Prologue with placeholder for local frame size
@@ -2108,15 +2043,10 @@ unsafe fn parse_function(fn_type: i32, is_ptr: i32, name: *const u8) {
     let prologue_patch = emit::pos();
     emit::dword(0);
 
-    let saved_local_offset = LOCAL_OFFSET;
     LOCAL_OFFSET = 0;
 
     // Body
-    lex::expect(TOK_LBRACE);
-    while !tok_is(TOK_RBRACE) && !tok_is(TOK_EOF) && !HAD_ERROR {
-        parse_stmt();
-    }
-    lex::expect(TOK_RBRACE);
+    parse_block();
 
     // Default return 0 + epilogue (for fall-through)
     emit::mov_reg_imm(REG_EAX, 0);
@@ -2126,30 +2056,43 @@ unsafe fn parse_function(fn_type: i32, is_ptr: i32, name: *const u8) {
     let total = (-LOCAL_OFFSET + 15) & !15;
     emit::patch_dword(prologue_patch, total as u32);
 
-    LOCAL_OFFSET = saved_local_offset;
     sym::leave_scope();
 }
 
-// Parse a global variable declaration
-unsafe fn parse_global_var(var_type: i32, is_ptr: i32, name: *const u8) {
-    if tok_is(TOK_LBRACKET) {
+// Parse a global static variable: static mut NAME: TYPE = VAL;
+unsafe fn parse_global_static() {
+    lex::next(); // consume 'static'
+
+    // Expect 'mut' for now (v1: always static mut)
+    if tok_is(TOK_MUT) {
         lex::next();
-        let arr_size = (*lex::peek()).num_val;
-        lex::next();
-        lex::expect(TOK_RBRACKET);
-        let elem_sz = if var_type == TYPE_CHAR { 1 } else { 4 };
-        let mut total = arr_size * elem_sz;
-        total = (total + 3) & !3; // align to 4
-        let addr = global_data_base() + GLOBAL_OFFSET;
-        GLOBAL_OFFSET += total as u32;
-        sym::add(name, SYM_GLOBAL, var_type, 1, 0, addr);
-        lex::expect(TOK_SEMI);
+    }
+
+    if !tok_is(TOK_IDENT) {
+        rc_error(b"expected variable name\0");
+        return;
+    }
+    let mut name = [0u8; 32];
+    string::strncpy(name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+    name[31] = 0;
+    lex::next();
+
+    lex::expect(TOK_COLON);
+
+    let mut vtype = 0i32;
+    let mut vptr = 0i32;
+    if !parse_type(&mut vtype, &mut vptr) {
+        rc_error(b"expected type\0");
         return;
     }
 
     let addr = global_data_base() + GLOBAL_OFFSET;
     GLOBAL_OFFSET += 4;
-    sym::add(name, SYM_GLOBAL, var_type, is_ptr, 0, addr);
+    sym::add(name.as_ptr(), SYM_GLOBAL, vtype, vptr, 0, addr);
+
+    if PARSED_STRUCT_NAME[0] != 0 {
+        set_sym_struct(name.as_ptr(), PARSED_STRUCT_NAME.as_ptr());
+    }
 
     if tok_is(TOK_ASSIGN) {
         let mut neg = false;
@@ -2171,10 +2114,160 @@ unsafe fn parse_global_var(var_type: i32, is_ptr: i32, name: *const u8) {
                 GLOBAL_INIT_COUNT += 1;
             }
         } else {
-            cc_error(b"expected constant initializer\0");
+            rc_error(b"expected constant initializer\0");
         }
     }
     lex::expect(TOK_SEMI);
+}
+
+// Parse a global const: const NAME: TYPE = VAL;
+unsafe fn parse_global_const() {
+    lex::next(); // consume 'const'
+
+    if !tok_is(TOK_IDENT) {
+        rc_error(b"expected constant name\0");
+        return;
+    }
+    let mut name = [0u8; 32];
+    string::strncpy(name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+    name[31] = 0;
+    lex::next();
+
+    lex::expect(TOK_COLON);
+
+    let mut vtype = 0i32;
+    let mut vptr = 0i32;
+    if !parse_type(&mut vtype, &mut vptr) {
+        rc_error(b"expected type\0");
+        return;
+    }
+
+    lex::expect(TOK_ASSIGN);
+
+    let mut neg = false;
+    if tok_is(TOK_MINUS) {
+        neg = true;
+        lex::next();
+    }
+    if !tok_is(TOK_NUM) {
+        rc_error(b"expected constant value\0");
+        return;
+    }
+    let mut val = (*lex::peek()).num_val;
+    if neg {
+        val = -val;
+    }
+    lex::next();
+
+    sym::add(name.as_ptr(), SYM_CONST, vtype, vptr, 0, val as u32);
+    lex::expect(TOK_SEMI);
+}
+
+// Parse a type alias: type X = Y;
+unsafe fn parse_type_alias() {
+    lex::next(); // consume 'type'
+
+    if !tok_is(TOK_IDENT) {
+        rc_error(b"expected type alias name\0");
+        return;
+    }
+    let mut td_name = [0u8; 32];
+    string::strncpy(td_name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+    td_name[31] = 0;
+    lex::next();
+
+    lex::expect(TOK_ASSIGN);
+
+    let mut td_type = 0i32;
+    let mut td_ptr = 0i32;
+    if !parse_type(&mut td_type, &mut td_ptr) {
+        rc_error(b"expected type\0");
+        return;
+    }
+
+    if (TYPEDEF_COUNT as usize) < MAX_TYPEDEFS {
+        string::strncpy(
+            TYPEDEFS[TYPEDEF_COUNT as usize].name.as_mut_ptr(),
+            td_name.as_ptr(),
+            31,
+        );
+        TYPEDEFS[TYPEDEF_COUNT as usize].td_type = td_type;
+        TYPEDEFS[TYPEDEF_COUNT as usize].is_ptr = td_ptr;
+        TYPEDEF_COUNT += 1;
+    }
+    lex::expect(TOK_SEMI);
+}
+
+// Parse struct definition: struct Name { field: Type, ... }
+// No trailing semicolon (Rust syntax).
+// Fields use name: Type with commas between them.
+unsafe fn parse_struct_def() {
+    lex::next(); // consume 'struct'
+
+    if !tok_is(TOK_IDENT) {
+        rc_error(b"expected struct name\0");
+        return;
+    }
+    let mut name = [0u8; 32];
+    string::strncpy(name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+    name[31] = 0;
+    lex::next();
+
+    let def = sym::struct_def_add(name.as_ptr());
+    if def.is_null() {
+        return;
+    }
+
+    let mut foffset = 0i32;
+    lex::expect(TOK_LBRACE);
+
+    while !tok_is(TOK_RBRACE) && !tok_is(TOK_EOF) && !HAD_ERROR {
+        // Rust syntax: field_name: Type,
+        if !tok_is(TOK_IDENT) {
+            rc_error(b"expected field name\0");
+            break;
+        }
+        let mut fname = [0u8; 32];
+        string::strncpy(fname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
+        fname[31] = 0;
+        lex::next();
+
+        lex::expect(TOK_COLON);
+
+        let mut ftype = 0i32;
+        let mut fptr = 0i32;
+        if !parse_type(&mut ftype, &mut fptr) {
+            rc_error(b"expected field type\0");
+            break;
+        }
+
+        if (*def).field_count >= MAX_STRUCT_FIELDS as i32 {
+            rc_error(b"too many struct fields\0");
+            break;
+        }
+
+        let fld = &mut (*def).fields[(*def).field_count as usize];
+        (*def).field_count += 1;
+        string::strncpy(fld.name.as_mut_ptr(), fname.as_ptr(), 31);
+        fld.name[31] = 0;
+        fld.field_type = ftype;
+        fld.is_ptr = fptr;
+        fld.offset = foffset;
+        fld.elem_size = 4;
+        foffset += 4;
+
+        // Comma between fields (optional before closing brace)
+        if tok_is(TOK_COMMA) {
+            lex::next();
+        }
+    }
+    (*def).size = foffset;
+    if (*def).size % 4 != 0 {
+        (*def).size = ((*def).size + 3) & !3;
+    }
+
+    lex::expect(TOK_RBRACE);
+    // No trailing semicolon for struct in Rust syntax
 }
 
 // ---- Entry point ----
@@ -2204,250 +2297,50 @@ pub unsafe fn parse_program() -> i32 {
 
     // Parse all top-level declarations
     while !tok_is(TOK_EOF) && !HAD_ERROR {
-        let mut tp = 0i32;
-        let mut is_ptr = 0i32;
-        let mut name = [0u8; 32];
-        let mut sname = [0u8; 32];
-
-        // Typedef at top level
-        if tok_is(TOK_TYPEDEF) {
-            lex::next(); // consume 'typedef'
-
-            // Handle typedef enum { ... } Name;
-            if tok_is(TOK_ENUM) {
-                parse_enum();
-                // Skip optional typedef name after enum
-                if tok_is(TOK_IDENT) {
-                    lex::next();
-                }
-                if tok_is(TOK_SEMI) {
-                    lex::next();
-                }
-                continue;
-            }
-
-            // Handle typedef struct Name { ... } alias;
-            if tok_is(TOK_STRUCT) {
-                lex::next(); // 'struct'
-                if tok_is(TOK_IDENT) {
-                    lex::next(); // struct name
-                }
-                if tok_is(TOK_LBRACE) {
-                    // Skip struct body
-                    let mut depth = 1i32;
-                    lex::next();
-                    while depth > 0 && !tok_is(TOK_EOF) {
-                        if tok_is(TOK_LBRACE) {
-                            depth += 1;
-                        }
-                        if tok_is(TOK_RBRACE) {
-                            depth -= 1;
-                        }
-                        lex::next();
-                    }
-                }
-                // The alias name
-                if tok_is(TOK_IDENT) {
-                    let mut td_name = [0u8; 32];
-                    string::strncpy(
-                        td_name.as_mut_ptr(),
-                        (*lex::peek()).str_val.as_ptr(),
-                        31,
-                    );
-                    td_name[31] = 0;
-                    lex::next();
-                    if (TYPEDEF_COUNT as usize) < MAX_TYPEDEFS {
-                        string::strncpy(
-                            TYPEDEFS[TYPEDEF_COUNT as usize].name.as_mut_ptr(),
-                            td_name.as_ptr(),
-                            31,
-                        );
-                        TYPEDEFS[TYPEDEF_COUNT as usize].td_type = TYPE_INT;
-                        TYPEDEFS[TYPEDEF_COUNT as usize].is_ptr = 0;
-                        TYPEDEF_COUNT += 1;
-                    }
-                }
-                if tok_is(TOK_SEMI) {
-                    lex::next();
-                }
-                continue;
-            }
-
-            // Regular typedef: typedef int uint32; etc.
-            let mut td_type = 0i32;
-            let mut td_ptr = 0i32;
-            if !parse_type(&mut td_type, &mut td_ptr) {
-                // Skip to semicolon
-                while !tok_is(TOK_SEMI) && !tok_is(TOK_EOF) {
-                    lex::next();
-                }
-                if tok_is(TOK_SEMI) {
-                    lex::next();
-                }
-                continue;
-            }
-            // Check for pointer
-            while tok_is(TOK_STAR) {
-                td_ptr = 1;
-                lex::next();
-            }
-            if tok_is(TOK_IDENT) {
-                let mut td_name = [0u8; 32];
-                string::strncpy(
-                    td_name.as_mut_ptr(),
-                    (*lex::peek()).str_val.as_ptr(),
-                    31,
-                );
-                td_name[31] = 0;
-                lex::next();
-                if (TYPEDEF_COUNT as usize) < MAX_TYPEDEFS {
-                    string::strncpy(
-                        TYPEDEFS[TYPEDEF_COUNT as usize].name.as_mut_ptr(),
-                        td_name.as_ptr(),
-                        31,
-                    );
-                    TYPEDEFS[TYPEDEF_COUNT as usize].td_type = td_type;
-                    TYPEDEFS[TYPEDEF_COUNT as usize].is_ptr = td_ptr;
-                    TYPEDEF_COUNT += 1;
-                }
-            }
-            if tok_is(TOK_SEMI) {
-                lex::next();
-            }
+        // fn name(...) [-> Type] { }
+        if tok_is(TOK_FN) {
+            parse_function();
             continue;
         }
 
-        // Enum definition at top level
+        // struct Name { ... }
+        if tok_is(TOK_STRUCT) {
+            parse_struct_def();
+            continue;
+        }
+
+        // enum Name { ... }
         if tok_is(TOK_ENUM) {
             parse_enum();
             continue;
         }
 
-        // Struct definition: struct Name { ... };
-        if tok_is(TOK_STRUCT) {
-            lex::next(); // consume 'struct'
-            if !tok_is(TOK_IDENT) {
-                cc_error(b"expected struct name\0");
-                break;
-            }
-            // Peek ahead: is this a definition or a variable/function?
-            string::strncpy(name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
-            name[31] = 0;
-            lex::next(); // consume struct name
-
-            if tok_is(TOK_LBRACE) {
-                // struct definition
-                let def = sym::struct_def_add(name.as_ptr());
-                if def.is_null() {
-                    break;
-                }
-
-                let mut foffset = 0i32;
-                lex::expect(TOK_LBRACE);
-                while !tok_is(TOK_RBRACE) && !tok_is(TOK_EOF) && !HAD_ERROR {
-                    let mut ftype = 0i32;
-                    let mut fptr = 0i32;
-                    let mut fname = [0u8; 32];
-
-                    if !parse_type(&mut ftype, &mut fptr) {
-                        cc_error(b"expected field type\0");
-                        break;
-                    }
-                    if !tok_is(TOK_IDENT) {
-                        cc_error(b"expected field name\0");
-                        break;
-                    }
-                    string::strncpy(fname.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
-                    fname[31] = 0;
-                    lex::next();
-                    lex::expect(TOK_SEMI);
-
-                    if (*def).field_count >= MAX_STRUCT_FIELDS as i32 {
-                        cc_error(b"too many struct fields\0");
-                        break;
-                    }
-
-                    let fld = &mut (*def).fields[(*def).field_count as usize];
-                    (*def).field_count += 1;
-                    string::strncpy(fld.name.as_mut_ptr(), fname.as_ptr(), 31);
-                    fld.name[31] = 0;
-                    fld.field_type = ftype;
-                    fld.is_ptr = fptr;
-                    fld.offset = foffset;
-                    fld.elem_size = 4;
-                    foffset += 4;
-                }
-                (*def).size = foffset;
-                if (*def).size % 4 != 0 {
-                    (*def).size = ((*def).size + 3) & !3;
-                }
-
-                lex::expect(TOK_RBRACE);
-                lex::expect(TOK_SEMI);
-                continue;
-            }
-
-            // struct variable or function: struct Name [*] ident
-            tp = TYPE_INT;
-            is_ptr = 0;
-            string::strncpy(sname.as_mut_ptr(), name.as_ptr(), 31);
-            sname[31] = 0;
-
-            while tok_is(TOK_STAR) {
-                is_ptr = 1;
-                lex::next();
-            }
-
-            if !tok_is(TOK_IDENT) {
-                cc_error(b"expected identifier after struct type\0");
-                break;
-            }
-            string::strncpy(name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
-            name[31] = 0;
-            lex::next();
-
-            if tok_is(TOK_LPAREN) {
-                // function with struct return/param type
-                parse_function(tp, is_ptr, name.as_ptr());
-            } else {
-                // global struct variable
-                if is_ptr != 0 {
-                    // struct pointer: 4 bytes
-                    let addr = global_data_base() + GLOBAL_OFFSET;
-                    GLOBAL_OFFSET += 4;
-                    sym::add(name.as_ptr(), SYM_GLOBAL, tp, is_ptr, 0, addr);
-                    set_sym_struct(name.as_ptr(), sname.as_ptr());
-                } else {
-                    // struct value: allocate def->size bytes
-                    let gdef = sym::struct_def_lookup(sname.as_ptr());
-                    let gsz = if !gdef.is_null() { (*gdef).size } else { 4 };
-                    let addr = global_data_base() + GLOBAL_OFFSET;
-                    GLOBAL_OFFSET += gsz as u32;
-                    sym::add(name.as_ptr(), SYM_GLOBAL, tp, 0, 0, addr);
-                    set_sym_struct(name.as_ptr(), sname.as_ptr());
-                }
-                lex::expect(TOK_SEMI);
-            }
+        // static mut NAME: TYPE = VAL;
+        if tok_is(TOK_STATIC) {
+            parse_global_static();
             continue;
         }
 
-        if !parse_type(&mut tp, &mut is_ptr) {
-            cc_error(b"expected type at top level\0");
-            break;
+        // const NAME: TYPE = VAL;
+        if tok_is(TOK_CONST) {
+            parse_global_const();
+            continue;
         }
-        if !tok_is(TOK_IDENT) {
-            cc_error(b"expected identifier\0");
-            break;
-        }
-        string::strncpy(name.as_mut_ptr(), (*lex::peek()).str_val.as_ptr(), 31);
-        name[31] = 0;
-        lex::next();
 
-        if tok_is(TOK_LPAREN) {
-            parse_function(tp, is_ptr, name.as_ptr());
-        } else {
-            parse_global_var(tp, is_ptr, name.as_ptr());
+        // type X = Y;
+        if tok_is(TOK_TYPE) {
+            parse_type_alias();
+            continue;
         }
+
+        // unsafe at top level -- transparent, skip keyword
+        if tok_is(TOK_UNSAFE) {
+            lex::next();
+            continue;
+        }
+
+        rc_error(b"expected fn, struct, enum, static, const, or type at top level\0");
+        break;
     }
 
     if HAD_ERROR || lex::had_error() {
@@ -2458,7 +2351,7 @@ pub unsafe fn parse_program() -> i32 {
     for i in 0..FIXUP_COUNT as usize {
         let s = sym::lookup(FIXUPS[i].name.as_ptr());
         if s.is_null() {
-            vga::puts(b"cc: undefined function: ");
+            vga::puts(b"rc: undefined function: ");
             vga::puts(&FIXUPS[i].name);
             vga::putchar(b'\n');
             return -1;
@@ -2491,7 +2384,7 @@ pub unsafe fn parse_program() -> i32 {
         // call main
         let main_sym = sym::lookup(b"main\0".as_ptr());
         if main_sym.is_null() {
-            cc_error(b"undefined reference to 'main'\0");
+            rc_error(b"undefined reference to 'main'\0");
             return -1;
         }
         emit::byte(0xE8);
