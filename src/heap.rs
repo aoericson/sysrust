@@ -12,7 +12,7 @@
 //
 // HEAP_START         0x00500000  (5 MB -- well above the kernel image)
 // HEAP_INITIAL_PAGES 256        (1 MB initial heap)
-// HEAP_MAX_PAGES     1024       (4 MB hard ceiling, still < 16 MB identity map)
+// HEAP_MAX_PAGES     16384      (64 MB ceiling, within 128 MB identity map)
 
 use crate::pmm;
 use crate::sync::Spinlock;
@@ -24,7 +24,7 @@ static mut HEAP_LOCK: Spinlock = Spinlock::new();
 
 const HEAP_START: u32 = 0x0050_0000;
 const HEAP_INITIAL_PAGES: u32 = 256;  // 1 MB
-const HEAP_MAX_PAGES: u32 = 1024;     // 4 MB
+const HEAP_MAX_PAGES: u32 = 16384;    // 64 MB
 const MIN_SPLIT: u32 = 16;            // don't split if remainder < this
 
 // ---- block header ----------------------------------------------------------

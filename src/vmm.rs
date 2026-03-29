@@ -3,10 +3,8 @@
 // Two-level page translation:
 //   Page Directory (1024 entries) -> Page Tables (1024 entries each) -> 4KB pages
 //
-// On init we identity-map the first 16MB so that phys == virt for the
-// kernel, VGA buffer, DMA regions, PMM bitmap, and the page tables
-// themselves.  This guarantees the code that enables paging is still
-// mapped the instant the PG bit is set in CR0.
+// On init we identity-map the first 128MB so that phys == virt for the
+// kernel, heap, DMA regions, page tables, and loaded ELF programs.
 
 use core::arch::asm;
 use crate::pmm;
@@ -17,6 +15,9 @@ pub const VMM_PAGE_SIZE: u32 = 4096;
 pub const PAGE_PRESENT: u32 = 0x01;
 pub const PAGE_WRITE: u32 = 0x02;
 pub const PAGE_USER: u32 = 0x04;
+
+// Number of 4MB regions to identity-map at boot (32 * 4MB = 128MB)
+const IDENTITY_MAP_ENTRIES: u32 = 32;
 
 // ---- private state ---------------------------------------------------------
 
@@ -30,7 +31,6 @@ unsafe fn invlpg(virt: u32) {
     asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
 }
 
-/// Zero `count` bytes at `dest`. Used in place of memset for page-sized zeroing.
 unsafe fn zero_page(dest: *mut u8, count: usize) {
     let mut i = 0;
     while i < count {
@@ -44,12 +44,11 @@ unsafe fn zero_page(dest: *mut u8, count: usize) {
 pub unsafe fn init() {
     // Allocate and zero the page directory
     PD_PHYS = pmm::alloc_page();
-    PAGE_DIRECTORY = PD_PHYS as *mut u32; // phys == virt in flat mode
+    PAGE_DIRECTORY = PD_PHYS as *mut u32;
     zero_page(PAGE_DIRECTORY as *mut u8, VMM_PAGE_SIZE as usize);
 
-    // Identity-map the first 16MB (4 page-directory entries, 4 page tables).
-    // Each page table covers 4MB (1024 entries * 4KB).
-    for i in 0u32..4 {
+    // Identity-map the first 128MB (32 page-directory entries, 32 page tables).
+    for i in 0u32..IDENTITY_MAP_ENTRIES {
         let pt_phys = pmm::alloc_page();
         let pt = pt_phys as *mut u32;
 
@@ -79,9 +78,8 @@ pub unsafe fn map_page(virt: u32, phys: u32, flags: u32) {
     // Allocate a page table if the directory entry is not present
     if (*PAGE_DIRECTORY.add(pd_idx)) & PAGE_PRESENT == 0 {
         let pt_phys = pmm::alloc_page();
-        // Guard against physical address outside identity-mapped region
-        if pt_phys >= 0x1000000 {
-            crate::vga::puts(b"vmm: PANIC: page table phys addr outside identity map\n");
+        if pt_phys == 0 {
+            crate::vga::puts(b"vmm: out of memory for page table\n");
             return;
         }
         zero_page(pt_phys as *mut u8, VMM_PAGE_SIZE as usize);
@@ -92,6 +90,18 @@ pub unsafe fn map_page(virt: u32, phys: u32, flags: u32) {
     *pt.add(pt_idx) = (phys & 0xFFFFF000) | (flags & 0xFFF);
 
     invlpg(virt);
+}
+
+/// Map a contiguous range of virtual to physical pages.
+pub unsafe fn map_range(virt_start: u32, phys_start: u32, size: u32, flags: u32) {
+    let pages = (size + VMM_PAGE_SIZE - 1) / VMM_PAGE_SIZE;
+    for i in 0..pages {
+        map_page(
+            virt_start + i * VMM_PAGE_SIZE,
+            phys_start + i * VMM_PAGE_SIZE,
+            flags,
+        );
+    }
 }
 
 pub unsafe fn unmap_page(virt: u32) {

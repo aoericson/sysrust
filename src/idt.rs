@@ -97,6 +97,16 @@ unsafe extern "C" {
     fn irq12(); fn irq13(); fn irq14(); fn irq15();
 }
 
+// Syscall stub (vector 128 = int 0x80), defined in isr.s
+unsafe extern "C" {
+    fn isr128();
+}
+
+/// Install the int 0x80 syscall gate in the IDT.
+pub unsafe fn install_isr128() {
+    idt_set_gate(128, isr128 as u32);
+}
+
 // Use thread::exit() directly instead of extern symbol
 
 /// Fill one IDT entry with a handler address.

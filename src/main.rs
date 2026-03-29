@@ -41,6 +41,8 @@ mod tcp;
 mod dns;
 mod rtl8139;
 mod rc;
+mod elf;
+mod syscall;
 mod shell;
 mod editor;
 mod recovery;
@@ -155,6 +157,8 @@ pub extern "C" fn kernel_main(magic: u32, mb_info: *const MultibootInfo) -> ! {
         net::init();
         dns::init();
         tcp::init();
+
+        syscall::init();
 
         initrd::init(mb);
         vfs::init();

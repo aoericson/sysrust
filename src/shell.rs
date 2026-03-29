@@ -22,6 +22,8 @@ use crate::net;
 use crate::tcp;
 use crate::fat16;
 use crate::rc;
+use crate::elf;
+use crate::syscall;
 use crate::recovery;
 use crate::thread;
 use crate::editor;
@@ -688,19 +690,49 @@ unsafe fn cmd_run() {
         return;
     }
 
-    // Load at CC_LOAD_BASE -- the default compiler target
-    let load_addr = rc::emit::CC_LOAD_BASE as *mut u8;
-    let n = vfs::read(node, 0, (*node).size, load_addr);
+    // Read file into a temporary buffer to check format
+    let file_size = (*node).size;
+    let buf = heap::kmalloc(file_size as usize);
+    if buf.is_null() {
+        vga::puts(b"Out of memory\n");
+        return;
+    }
+    let n = vfs::read(node, 0, file_size, buf);
     if n <= 0 {
         vga::puts(b"Read error\n");
+        heap::kfree(buf);
         return;
     }
 
-    // Run in a protected thread; returns -99 if the program crashed
-    let entry: extern "C" fn() = core::mem::transmute(load_addr);
-    let ret = recovery::run_protected(entry);
-    if ret == -99 {
-        vga::puts(b"Program crashed (return -99)\n");
+    // Check if ELF or flat binary
+    if n >= 4 && elf::is_elf(buf) {
+        // ELF binary
+        match elf::load(buf, n as u32) {
+            Ok(info) => {
+                heap::kfree(buf);
+                syscall::set_brk(info.brk);
+                let entry: extern "C" fn() = core::mem::transmute(info.entry as usize);
+                let ret = recovery::run_protected(entry);
+                if ret == -99 {
+                    vga::puts(b"Program crashed\n");
+                }
+            }
+            Err(msg) => {
+                heap::kfree(buf);
+                vga::puts(msg.as_bytes());
+                vga::putchar(b'\n');
+            }
+        }
+    } else {
+        // Flat binary — load at CC_LOAD_BASE (legacy)
+        let load_addr = rc::emit::CC_LOAD_BASE as *mut u8;
+        string::memcpy(load_addr, buf, n as usize);
+        heap::kfree(buf);
+        let entry: extern "C" fn() = core::mem::transmute(load_addr);
+        let ret = recovery::run_protected(entry);
+        if ret == -99 {
+            vga::puts(b"Program crashed (return -99)\n");
+        }
     }
 }
 

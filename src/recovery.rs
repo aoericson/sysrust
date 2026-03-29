@@ -33,6 +33,12 @@ extern "C" fn child_wrapper() {
     }
 }
 
+/// Set the child result and done flag from outside (used by sys_exit).
+pub unsafe fn set_child_result(result: i32) {
+    core::ptr::write_volatile(&raw mut CHILD_RESULT, result);
+    core::ptr::write_volatile(&raw mut CHILD_DONE, 1);
+}
+
 /// Run entry_point in a protected thread.
 ///
 /// The calling thread yields the CPU in a loop until the child thread

@@ -101,5 +101,12 @@ isr_common_stub:
     add esp, 8          ; discard int_no and err_code from the stack
     iret                ; return from interrupt
 
+; ---- Syscall stub (vector 128 = int 0x80) ----
+global isr128
+isr128:
+    push dword 0          ; dummy error code
+    push dword 128        ; interrupt number
+    jmp isr_common_stub
+
 ; Tell the linker this object doesn't need an executable stack
 section .note.GNU-stack noalloc noexec nowrite progbits
