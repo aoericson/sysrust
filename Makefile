@@ -77,5 +77,9 @@ clean:
 	rm -f kernel.elf tools/mkinitrd initrd.img test_output.txt
 	rm -rf sysroot
 
+sync-features:
+	cp ../c/opsys/docs/FEATURES.md docs/FEATURES.md
+	@echo "Synced docs/FEATURES.md from opsys"
+
 FORCE:
-.PHONY: all run test clean format-disk debug FORCE
+.PHONY: all run test clean format-disk debug FORCE sync-features
