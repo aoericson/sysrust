@@ -105,8 +105,8 @@ pub fn send_ethernet(dst_mac: &[u8; 6], ethertype: u16, payload: *const u8, payl
         }
 
         // Disable interrupts to prevent IRQ reentrancy on the static buffer
-        let flags: u32;
-        asm!("pushfd", "pop {0:e}", "cli", out(reg) flags);
+        let flags: u64;
+        asm!("pushfq", "pop {0}", "cli", out(reg) flags);
 
         let eth = FRAME.as_mut_ptr() as *mut EthHeader;
         string::memcpy((*eth).dst.as_mut_ptr(), dst_mac.as_ptr(), 6);
@@ -116,7 +116,7 @@ pub fn send_ethernet(dst_mac: &[u8; 6], ethertype: u16, payload: *const u8, payl
 
         rtl8139::send(FRAME.as_ptr(), 14 + payload_len);
 
-        asm!("push {0:e}", "popfd", in(reg) flags);
+        asm!("push {0}", "popfq", in(reg) flags);
     }
 }
 

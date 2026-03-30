@@ -4,4 +4,4 @@ build-std-features = ["compiler-builtins-mem"]
 json-target-spec = true
 
 [build]
-target = "x86-opsys.json"
+target = "x86_64-opsys.json"

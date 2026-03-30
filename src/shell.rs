@@ -21,6 +21,7 @@ use crate::dns;
 use crate::net;
 use crate::tcp;
 use crate::fat16;
+#[cfg(target_arch = "x86")]
 use crate::rc;
 use crate::elf;
 use crate::syscall;
@@ -200,7 +201,7 @@ unsafe fn cmd_reboot() {
     #[repr(C, packed)]
     struct NullIdt {
         limit: u16,
-        base: u32,
+        base: u64,
     }
     let null_idt = NullIdt { limit: 0, base: 0 };
     asm!("lidt [{}]", in(reg) &null_idt as *const NullIdt, options(nostack));
@@ -724,8 +725,9 @@ unsafe fn cmd_run() {
             }
         }
     } else {
-        // Flat binary — load at CC_LOAD_BASE (legacy)
-        let load_addr = rc::emit::CC_LOAD_BASE as *mut u8;
+        // Flat binary -- load at a fixed address (legacy)
+        const FLAT_LOAD_BASE: usize = 0x00A0_0000;
+        let load_addr = FLAT_LOAD_BASE as *mut u8;
         string::memcpy(load_addr, buf, n as usize);
         heap::kfree(buf);
         let entry: extern "C" fn() = core::mem::transmute(load_addr);
@@ -985,11 +987,18 @@ pub unsafe fn run() -> ! {
         } else if string::strncmp(input_ptr, b"rc\0".as_ptr(), 2) == 0
             && (INPUT[2] == b' ' || INPUT[2] == 0)
         {
-            if INPUT_LEN > 3 {
-                INPUT[INPUT_LEN] = 0;
-                rc::rc_compile(INPUT[3..].as_ptr(), core::ptr::null());
-            } else {
-                vga::puts(b"Usage: rc <file.rs>\n");
+            #[cfg(target_arch = "x86")]
+            {
+                if INPUT_LEN > 3 {
+                    INPUT[INPUT_LEN] = 0;
+                    rc::rc_compile(INPUT[3..].as_ptr(), core::ptr::null());
+                } else {
+                    vga::puts(b"Usage: rc <file.rs>\n");
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                vga::puts(b"rc compiler not available on x86_64\n");
             }
         } else if string::strncmp(input_ptr, b"run\0".as_ptr(), 3) == 0
             && (INPUT[3] == b' ' || INPUT[3] == 0)

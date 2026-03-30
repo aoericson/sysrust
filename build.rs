@@ -18,7 +18,7 @@ fn main() {
         }
 
         let status = Command::new("nasm")
-            .args(["-f", "elf32", &src.to_string_lossy(), "-o", &obj.to_string_lossy()])
+            .args(["-f", "elf64", &src.to_string_lossy(), "-o", &obj.to_string_lossy()])
             .status()
             .expect("failed to run nasm");
 

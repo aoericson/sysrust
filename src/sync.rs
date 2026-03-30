@@ -1,9 +1,9 @@
-// sync.rs -- Synchronization primitives for kernel threads.
+// sync.rs -- Synchronization primitives for kernel threads (x86_64).
 //
-// Single-core x86: disabling interrupts is sufficient to prevent
+// Single-core x86_64: disabling interrupts is sufficient to prevent
 // preemption by the timer. No atomic test-and-set is required.
 //
-// Spinlocks save/restore EFLAGS so that nested lock/unlock pairs
+// Spinlocks save/restore RFLAGS so that nested lock/unlock pairs
 // work correctly and interrupt-context callers (e.g. IRQ handlers)
 // don't accidentally re-enable interrupts on unlock.
 //
@@ -17,7 +17,7 @@ use crate::thread;
 /// Spinlock: disables interrupts to prevent preemption.
 pub struct Spinlock {
     pub locked: u32,
-    pub saved_flags: u32,
+    pub saved_flags: u64,
 }
 
 impl Spinlock {
@@ -31,10 +31,10 @@ impl Spinlock {
 
     /// Acquire the spinlock, disabling interrupts.
     pub unsafe fn lock(&mut self) {
-        let flags: u32;
+        let flags: u64;
         asm!(
-            "pushfd",
-            "pop {0:e}",
+            "pushfq",
+            "pop {0}",
             "cli",
             out(reg) flags,
             options(nostack),
@@ -48,8 +48,8 @@ impl Spinlock {
         let flags = self.saved_flags;
         self.locked = 0;
         asm!(
-            "push {0:e}",
-            "popfd",
+            "push {0}",
+            "popfq",
             in(reg) flags,
             options(nostack),
         );
@@ -73,10 +73,10 @@ impl Mutex {
     /// Acquire the mutex, yielding the CPU while contended.
     pub unsafe fn lock(&mut self) {
         loop {
-            let flags: u32;
+            let flags: u64;
             asm!(
-                "pushfd",
-                "pop {0:e}",
+                "pushfq",
+                "pop {0}",
                 "cli",
                 out(reg) flags,
                 options(nostack),
@@ -86,8 +86,8 @@ impl Mutex {
                 self.locked = 1;
                 self.owner = thread::get_current();
                 asm!(
-                    "push {0:e}",
-                    "popfd",
+                    "push {0}",
+                    "popfq",
                     in(reg) flags,
                     options(nostack),
                 );
@@ -95,8 +95,8 @@ impl Mutex {
             }
 
             asm!(
-                "push {0:e}",
-                "popfd",
+                "push {0}",
+                "popfq",
                 in(reg) flags,
                 options(nostack),
             );

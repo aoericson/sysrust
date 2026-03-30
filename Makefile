@@ -1,15 +1,15 @@
-KERNEL = target/x86-opsys/release/opsys
+KERNEL = target/x86_64-opsys/release/opsys
 CARGO  = cargo
 
 all: kernel.elf
 
 kernel.elf: FORCE
 	$(CARGO) +nightly build --release
-	cp $(KERNEL) kernel.elf
+	objcopy -O elf32-i386 $(KERNEL) kernel.elf
 
 debug: FORCE
 	$(CARGO) +nightly build
-	cp target/x86-opsys/debug/opsys kernel.elf
+	cp target/x86_64-opsys/debug/opsys kernel.elf
 
 # Host tools
 tools/mkinitrd: tools/mkinitrd.rs
@@ -44,13 +44,13 @@ format-disk:
 
 run: kernel.elf initrd.img
 	@if [ -f disk.img ]; then \
-		qemu-system-i386 -kernel kernel.elf -display curses \
+		qemu-system-x86_64 -kernel kernel.elf -display curses \
 			-device rtl8139,netdev=net0 -netdev user,id=net0 \
 			-initrd initrd.img \
 			-serial tcp::2324,server,nowait \
 			-drive file=disk.img,format=raw,if=ide,index=0; \
 	else \
-		qemu-system-i386 -kernel kernel.elf -display curses \
+		qemu-system-x86_64 -kernel kernel.elf -display curses \
 			-device rtl8139,netdev=net0 -netdev user,id=net0 \
 			-initrd initrd.img \
 			-serial tcp::2324,server,nowait; \
@@ -58,7 +58,7 @@ run: kernel.elf initrd.img
 
 test: kernel.elf initrd.img
 	@echo "Running opsys compiler test suite..."
-	@timeout 60 qemu-system-i386 -kernel kernel.elf -display none \
+	@timeout 60 qemu-system-x86_64 -kernel kernel.elf -display none \
 		-device rtl8139,netdev=net0 -netdev user,id=net0 \
 		-initrd initrd.img -serial stdio -append "autotest" \
 		-no-reboot 2>/dev/null | tee test_output.txt; \

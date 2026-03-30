@@ -6,13 +6,13 @@
 // Layout:
 //   [BlockHeader][...usable bytes...]  [BlockHeader][...usable bytes...]  ...
 //
-// The heap lives within the first 16MB identity-mapped region so no
+// The heap lives within the first 1GB identity-mapped region so no
 // additional VMM mappings are required at runtime.  Physical pages are
 // allocated from the PMM and mapped explicitly via the VMM on expansion.
 //
 // HEAP_START         0x00500000  (5 MB -- well above the kernel image)
 // HEAP_INITIAL_PAGES 256        (1 MB initial heap)
-// HEAP_MAX_PAGES     16384      (64 MB ceiling, within 128 MB identity map)
+// HEAP_MAX_PAGES     16384      (64 MB ceiling, within identity map)
 
 use crate::pmm;
 use crate::sync::Spinlock;
@@ -22,21 +22,21 @@ static mut HEAP_LOCK: Spinlock = Spinlock::new();
 
 // ---- tunables --------------------------------------------------------------
 
-const HEAP_START: u32 = 0x0050_0000;
-const HEAP_INITIAL_PAGES: u32 = 256;  // 1 MB
-const HEAP_MAX_PAGES: u32 = 16384;    // 64 MB
-const MIN_SPLIT: u32 = 16;            // don't split if remainder < this
+const HEAP_START: u64 = 0x0050_0000;
+const HEAP_INITIAL_PAGES: u64 = 256;  // 1 MB
+const HEAP_MAX_PAGES: u64 = 16384;    // 64 MB
+const MIN_SPLIT: u64 = 16;            // don't split if remainder < this
 
 // ---- block header ----------------------------------------------------------
 
-// Each allocation is preceded by a BlockHeader. The struct is padded to
-// 12 bytes so that the data area that follows is always 4-byte-aligned
-// (assuming HEAP_START is 4-byte-aligned, which it is at 5 MB).
+// Each allocation is preceded by a BlockHeader. On x86_64 the struct is
+// 16 bytes (4 + 4 + 8) so that the data area that follows is always
+// 8-byte-aligned (assuming HEAP_START is 8-byte-aligned, which it is at 5 MB).
 //
-// Field layout (32-bit x86):
+// Field layout (64-bit x86_64):
 //   offset 0  : size     (4 bytes) -- usable bytes, NOT including header
 //   offset 4  : is_free  (4 bytes) -- 1 = free, 0 = allocated
-//   offset 8  : next     (4 bytes) -- next BlockHeader* in the flat list
+//   offset 8  : next     (8 bytes) -- next BlockHeader* in the flat list
 #[repr(C)]
 struct BlockHeader {
     size: u32,
@@ -44,12 +44,12 @@ struct BlockHeader {
     next: *mut BlockHeader,
 }
 
-const HEADER_SIZE: u32 = core::mem::size_of::<BlockHeader>() as u32;
+const HEADER_SIZE: u64 = core::mem::size_of::<BlockHeader>() as u64;
 
 // ---- module state ----------------------------------------------------------
 
 static mut HEAP_HEAD: *mut BlockHeader = core::ptr::null_mut();
-static mut HEAP_PAGES: u32 = 0;
+static mut HEAP_PAGES: u64 = 0;
 
 // ---- private helpers -------------------------------------------------------
 
@@ -59,13 +59,13 @@ static mut HEAP_PAGES: u32 = 0;
 ///
 /// Returns true on success, false if the PMM is exhausted or the page
 /// ceiling would be exceeded.
-unsafe fn expand_heap(pages: u32) -> bool {
+unsafe fn expand_heap(pages: u64) -> bool {
     if HEAP_PAGES + pages > HEAP_MAX_PAGES {
         return false;
     }
 
     let base_virt = HEAP_START + HEAP_PAGES * vmm::VMM_PAGE_SIZE;
-    let mut mapped: u32 = 0;
+    let mut mapped: u64 = 0;
 
     for i in 0..pages {
         let phys = pmm::alloc_page();
@@ -87,7 +87,7 @@ unsafe fn expand_heap(pages: u32) -> bool {
 
     // Carve a single free block out of the newly mapped region
     let blk = base_virt as *mut BlockHeader;
-    (*blk).size = mapped * vmm::VMM_PAGE_SIZE - HEADER_SIZE;
+    (*blk).size = (mapped * vmm::VMM_PAGE_SIZE - HEADER_SIZE) as u32;
     (*blk).is_free = 1;
     (*blk).next = core::ptr::null_mut();
 
@@ -114,10 +114,10 @@ unsafe fn coalesce() {
         if (*cur).is_free != 0 && !(*cur).next.is_null() && (*(*cur).next).is_free != 0 {
             // Check physical adjacency: the next header must sit exactly
             // HEADER_SIZE + cur->size bytes after cur.
-            let expected_next = (cur as *mut u8).add((HEADER_SIZE + (*cur).size) as usize);
+            let expected_next = (cur as *mut u8).add((HEADER_SIZE as u32 + (*cur).size) as usize);
             if expected_next as *mut BlockHeader == (*cur).next {
                 // Merge: absorb next into cur
-                (*cur).size += HEADER_SIZE + (*(*cur).next).size;
+                (*cur).size += HEADER_SIZE as u32 + (*(*cur).next).size;
                 (*cur).next = (*(*cur).next).next;
                 // Don't advance cur -- keep trying to merge further
                 continue;
@@ -132,11 +132,11 @@ unsafe fn coalesce() {
 unsafe fn try_alloc(cur: *mut BlockHeader, aligned_size: u32) -> *mut u8 {
     if (*cur).is_free != 0 && (*cur).size >= aligned_size {
         // Split if there is enough room for a header + MIN_SPLIT bytes
-        if (*cur).size >= aligned_size + HEADER_SIZE + MIN_SPLIT {
-            let split = (cur as *mut u8).add((HEADER_SIZE + aligned_size) as usize)
+        if (*cur).size >= aligned_size + HEADER_SIZE as u32 + MIN_SPLIT as u32 {
+            let split = (cur as *mut u8).add((HEADER_SIZE as u32 + aligned_size) as usize)
                 as *mut BlockHeader;
 
-            (*split).size = (*cur).size - aligned_size - HEADER_SIZE;
+            (*split).size = (*cur).size - aligned_size - HEADER_SIZE as u32;
             (*split).is_free = 1;
             (*split).next = (*cur).next;
 
@@ -165,8 +165,8 @@ pub unsafe fn kmalloc(size: usize) -> *mut u8 {
 
     HEAP_LOCK.lock();
 
-    // Round up to 4-byte alignment
-    let aligned_size = ((size as u32) + 3) & !3;
+    // Round up to 8-byte alignment
+    let aligned_size = ((size as u32) + 7) & !7;
 
     // First-fit search
     let mut cur = HEAP_HEAD;
@@ -180,7 +180,7 @@ pub unsafe fn kmalloc(size: usize) -> *mut u8 {
     }
 
     // No suitable block found -- try to grow the heap
-    let mut need_pages = (aligned_size + HEADER_SIZE + vmm::VMM_PAGE_SIZE - 1)
+    let mut need_pages = (aligned_size as u64 + HEADER_SIZE + vmm::VMM_PAGE_SIZE - 1)
         / vmm::VMM_PAGE_SIZE;
     if need_pages < 16 {
         need_pages = 16; // grow by at least 64 KB at a time

@@ -11,7 +11,7 @@
 
 use crate::multiboot::{MultibootInfo, MmapEntry, MULTIBOOT_FLAG_MMAP};
 
-pub const PAGE_SIZE: u32 = 4096;
+pub const PAGE_SIZE: u64 = 4096;
 
 const MAX_PAGES: u32 = 131072; // support up to 512MB
 
@@ -21,7 +21,7 @@ static mut FREE_PAGES: u32 = 0;
 
 // Linker-provided symbol marking the end of the kernel image
 unsafe extern "C" {
-    static __bss_end: u32;
+    static __bss_end: u8;
 }
 
 // ---- internal helpers ------------------------------------------------------
@@ -42,9 +42,9 @@ fn bitmap_test(page: u32) -> bool {
     unsafe { (BITMAP[(page / 32) as usize] & (1u32 << (page % 32))) != 0 }
 }
 
-fn mark_region_free(base: u32, length: u32) {
-    let page_start = base / PAGE_SIZE;
-    let mut page_end = (base + length) / PAGE_SIZE;
+fn mark_region_free(base: u64, length: u64) {
+    let page_start = (base / PAGE_SIZE) as u32;
+    let mut page_end = ((base + length) / PAGE_SIZE) as u32;
 
     if page_start >= MAX_PAGES {
         return;
@@ -63,10 +63,10 @@ fn mark_region_free(base: u32, length: u32) {
     }
 }
 
-fn mark_region_used(base: u32, length: u32) {
-    let page_start = base / PAGE_SIZE;
+fn mark_region_used(base: u64, length: u64) {
+    let page_start = (base / PAGE_SIZE) as u32;
     // Round up to cover partial pages
-    let mut page_end = (base + length + PAGE_SIZE - 1) / PAGE_SIZE;
+    let mut page_end = ((base + length + PAGE_SIZE - 1) / PAGE_SIZE) as u32;
 
     if page_start >= MAX_PAGES {
         return;
@@ -88,8 +88,8 @@ fn mark_region_used(base: u32, length: u32) {
 // ---- public API ------------------------------------------------------------
 
 pub unsafe fn init(mb_info: &MultibootInfo) {
-    let kernel_start: u32 = 0x100000;
-    let kernel_end: u32 = &__bss_end as *const u32 as u32;
+    let kernel_start: u64 = 0x100000;
+    let kernel_end: u64 = &__bss_end as *const u8 as u64;
 
     // Step 1: mark everything as used
     for i in 0..(MAX_PAGES / 32) as usize {
@@ -105,13 +105,13 @@ pub unsafe fn init(mb_info: &MultibootInfo) {
             let entry = &*((mb_info.mmap_addr + offset) as *const MmapEntry);
 
             if entry.entry_type == 1 && entry.base_high == 0 {
-                let base = entry.base_low;
-                let length = entry.length_low;
+                let base = entry.base_low as u64;
+                let length = entry.length_low as u64;
 
                 // Clamp to MAX_PAGES worth of memory
                 let mut end = base + length;
-                if end > MAX_PAGES * PAGE_SIZE {
-                    end = MAX_PAGES * PAGE_SIZE;
+                if end > MAX_PAGES as u64 * PAGE_SIZE {
+                    end = MAX_PAGES as u64 * PAGE_SIZE;
                 }
                 if base < end {
                     mark_region_free(base, end - base);
@@ -144,7 +144,7 @@ pub unsafe fn init(mb_info: &MultibootInfo) {
     }
 }
 
-pub fn reserve_range(start: u32, end: u32) {
+pub fn reserve_range(start: u64, end: u64) {
     if end <= start {
         return;
     }
@@ -152,7 +152,7 @@ pub fn reserve_range(start: u32, end: u32) {
     mark_region_used(start, length);
 }
 
-pub fn alloc_page() -> u32 {
+pub fn alloc_page() -> u64 {
     unsafe {
         for i in 0..(MAX_PAGES / 32) as usize {
             if BITMAP[i] != 0xFFFF_FFFF {
@@ -160,7 +160,7 @@ pub fn alloc_page() -> u32 {
                     if (BITMAP[i] & (1u32 << bit)) == 0 {
                         BITMAP[i] |= 1u32 << bit;
                         FREE_PAGES -= 1;
-                        return (i as u32 * 32 + bit) * PAGE_SIZE;
+                        return (i as u64 * 32 + bit as u64) * PAGE_SIZE;
                     }
                 }
             }
@@ -169,12 +169,12 @@ pub fn alloc_page() -> u32 {
     0 // out of memory
 }
 
-pub fn free_page(addr: u32) {
+pub fn free_page(addr: u64) {
     // Guard against freeing the null/OOM sentinel address
     if addr == 0 {
         return;
     }
-    let page = addr / PAGE_SIZE;
+    let page = (addr / PAGE_SIZE) as u32;
     if page >= MAX_PAGES {
         return;
     }

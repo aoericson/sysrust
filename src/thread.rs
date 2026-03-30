@@ -31,21 +31,21 @@ pub enum ThreadState {
 #[repr(C)]
 pub struct Thread {
     pub id: u32,
-    pub esp: u32,
+    pub rsp: u64,
     pub state: ThreadState,
     pub stack_base: *mut u8, // base of kmalloc'd stack (null for thread 0)
 }
 
 /// Assembly routine in boot/boot.s -- swaps stack pointers and
-/// saves/restores callee-saved registers (ebx, esi, edi, ebp).
+/// saves/restores callee-saved registers (rbx, rbp, r12, r13, r14, r15).
 unsafe extern "C" {
-    fn context_switch(old_esp: *mut u32, new_esp: u32);
+    fn context_switch(old_rsp: *mut u64, new_rsp: u64);
 }
 
 static mut THREADS: [Thread; MAX_THREADS] = {
     const DEAD_THREAD: Thread = Thread {
         id: 0,
-        esp: 0,
+        rsp: 0,
         state: ThreadState::Dead,
         stack_base: ptr::null_mut(),
     };
@@ -71,7 +71,7 @@ pub fn init() {
         }
 
         THREADS[0].id = 0;
-        THREADS[0].esp = 0; // filled on first context switch
+        THREADS[0].rsp = 0; // filled on first context switch
         THREADS[0].state = ThreadState::Running;
         THREADS[0].stack_base = ptr::null_mut(); // boot stack, not from kmalloc
 
@@ -111,37 +111,43 @@ pub fn create(entry: extern "C" fn()) -> i32 {
         ptr::write_bytes(stack, 0, THREAD_STACK_SIZE);
 
         // Stack grows downward; sp starts at the top
-        let mut sp = stack.add(THREAD_STACK_SIZE) as *mut u32;
+        let mut sp = stack.add(THREAD_STACK_SIZE) as *mut u64;
 
         // Build the initial stack frame (addresses decrease as we push).
-        // context_switch saves/restores in push ebx/esi/edi/ebp order,
-        // then restores with pop ebp/edi/esi/ebx (LIFO).
+        // context_switch saves/restores in push rbx/rbp/r12/r13/r14/r15 order,
+        // then restores with pop r15/r14/r13/r12/rbp/rbx (LIFO).
         // So the initial frame must have (from high to low address):
         //
         //   exit          <- return address if entry() returns
         //   entry         <- return address for context_switch's `ret`
-        //   0             <- saved ebp (popped first by context_switch)
-        //   0             <- saved edi
-        //   0             <- saved esi
-        //   0             <- saved ebx (popped last, SP points here)
+        //   0             <- saved r15 (popped first by context_switch)
+        //   0             <- saved r14
+        //   0             <- saved r13
+        //   0             <- saved r12
+        //   0             <- saved rbp
+        //   0             <- saved rbx (popped last, SP points here)
         sp = sp.offset(-1);
-        *sp = exit as u32; // if entry() returns
+        *sp = exit as u64; // if entry() returns
         sp = sp.offset(-1);
-        *sp = entry as u32; // context_switch ret target
+        *sp = entry as u64; // context_switch ret target
         sp = sp.offset(-1);
-        *sp = 0; // saved ebp (popped first)
+        *sp = 0; // saved r15 (popped first)
         sp = sp.offset(-1);
-        *sp = 0; // saved edi
+        *sp = 0; // saved r14
         sp = sp.offset(-1);
-        *sp = 0; // saved esi
+        *sp = 0; // saved r13
         sp = sp.offset(-1);
-        *sp = 0; // saved ebx (popped last, at SP)
+        *sp = 0; // saved r12
+        sp = sp.offset(-1);
+        *sp = 0; // saved rbp
+        sp = sp.offset(-1);
+        *sp = 0; // saved rbx (popped last, at SP)
 
         let tid = NEXT_ID;
         NEXT_ID += 1;
 
         THREADS[slot].id = tid;
-        THREADS[slot].esp = sp as u32;
+        THREADS[slot].rsp = sp as u64;
         THREADS[slot].state = ThreadState::Ready;
         THREADS[slot].stack_base = stack;
 
@@ -185,7 +191,7 @@ unsafe fn schedule() {
     THREADS[next].state = ThreadState::Running;
     CURRENT_THREAD = next;
 
-    context_switch(&raw mut THREADS[old].esp, THREADS[next].esp);
+    context_switch(&raw mut THREADS[old].rsp, THREADS[next].rsp);
 }
 
 /// Voluntarily give up the CPU.
@@ -196,11 +202,11 @@ unsafe fn schedule() {
 /// switch with cli/sti to be safe.
 pub fn yield_thread() {
     unsafe {
-        // Save and restore the previous IF state via pushf/popf so
+        // Save and restore the previous IF state via pushfq/popfq so
         // voluntary yields re-enable interrupts afterwards and
         // interrupt-context yields leave them disabled.
-        let flags: u32;
-        asm!("pushfd; pop {0}", out(reg) flags);
+        let flags: u64;
+        asm!("pushfq; pop {0}", out(reg) flags);
         asm!("cli");
 
         schedule();

@@ -40,6 +40,7 @@ mod udp;
 mod tcp;
 mod dns;
 mod rtl8139;
+#[cfg(target_arch = "x86")]
 mod rc;
 mod elf;
 mod syscall;
@@ -70,39 +71,39 @@ unsafe fn print_uint(val: u32) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_main(magic: u32, mb_info: *const MultibootInfo) -> ! {
+pub extern "C" fn kernel_main(magic: u64, mb_info: u64) -> ! {
     unsafe {
         vga::init();
         vga::set_80x50();
         serial::init();
         vga::set_serial_mirror(true);
 
-        if magic != MULTIBOOT_MAGIC {
+        if magic as u32 != MULTIBOOT_MAGIC {
             vga::puts(b"ERROR: Not booted via Multiboot!\n");
             loop { asm!("hlt"); }
         }
 
-        let mb = &*mb_info;
+        let mb = &*(mb_info as *const MultibootInfo);
 
         pmm::init(mb);
 
         // Reserve memory used by Multiboot structures
         pmm::reserve_range(
-            mb_info as u32,
-            mb_info as u32 + core::mem::size_of::<MultibootInfo>() as u32,
+            mb_info,
+            mb_info + core::mem::size_of::<MultibootInfo>() as u64,
         );
 
         if mb.flags & MULTIBOOT_FLAG_MMAP != 0 {
-            pmm::reserve_range(mb.mmap_addr, mb.mmap_addr + mb.mmap_length);
+            pmm::reserve_range(mb.mmap_addr as u64, (mb.mmap_addr + mb.mmap_length) as u64);
         }
 
         if mb.flags & MULTIBOOT_FLAG_MODS != 0 && mb.mods_count > 0 {
             let mod_entry = &*(mb.mods_addr as *const ModEntry);
             pmm::reserve_range(
-                mb.mods_addr,
-                mb.mods_addr + mb.mods_count * core::mem::size_of::<ModEntry>() as u32,
+                mb.mods_addr as u64,
+                (mb.mods_addr + mb.mods_count * core::mem::size_of::<ModEntry>() as u32) as u64,
             );
-            pmm::reserve_range(mod_entry.mod_start, mod_entry.mod_end);
+            pmm::reserve_range(mod_entry.mod_start as u64, mod_entry.mod_end as u64);
         }
 
         vga::puts(b"PMM: ");
@@ -115,11 +116,12 @@ pub extern "C" fn kernel_main(magic: u32, mb_info: *const MultibootInfo) -> ! {
         vga::puts(b"VMM: Paging enabled\n");
 
         // Identity-map multiboot structures and module memory
+        // (Multiboot1 addresses are u32, widen to u64 for VMM)
         if mb.flags & MULTIBOOT_FLAG_MODS != 0 && mb.mods_count > 0 {
-            let mods_page = mb.mods_addr & !0xFFF;
-            let mods_end = (mb.mods_addr
+            let mods_page = (mb.mods_addr & !0xFFF) as u64;
+            let mods_end = ((mb.mods_addr
                 + mb.mods_count * core::mem::size_of::<ModEntry>() as u32
-                + 0xFFF) & !0xFFF;
+                + 0xFFF) & !0xFFF) as u64;
 
             let mut addr = mods_page;
             while addr < mods_end {
@@ -130,8 +132,8 @@ pub extern "C" fn kernel_main(magic: u32, mb_info: *const MultibootInfo) -> ! {
             }
 
             let mod_entry = &*(mb.mods_addr as *const ModEntry);
-            let start = mod_entry.mod_start & !0xFFF;
-            let end = (mod_entry.mod_end + 0xFFF) & !0xFFF;
+            let start = (mod_entry.mod_start & !0xFFF) as u64;
+            let end = ((mod_entry.mod_end + 0xFFF) & !0xFFF) as u64;
 
             addr = start;
             while addr < end {
@@ -179,50 +181,59 @@ pub extern "C" fn kernel_main(magic: u32, mb_info: *const MultibootInfo) -> ! {
                 vga::puts(b"Autotest mode\n");
                 vga::puts(b"AUTOTEST START\n");
 
-                vga::puts(b"Compiling hello.rs...\n");
-                if rc::rc_compile(b"hello.rs\0".as_ptr(), b"hello.bin\0".as_ptr()) != 0 {
-                    vga::puts(b"FAIL compile hello.rs\n");
-                    vga::puts(b"AUTOTEST END\n");
-                    loop { asm!("hlt"); }
-                }
-                vga::puts(b"Running hello.bin...\n");
-                if let Some(node) = vfs::finddir_root(b"hello.bin\0".as_ptr()) {
-                    let load = rc::emit::CC_LOAD_BASE as *mut u8;
-                    let n = vfs::read(node, 0, (*node).size, load);
-                    if n > 0 {
-                        let entry: extern "C" fn() -> i32 =
-                            core::mem::transmute(rc::emit::CC_LOAD_BASE as *const ());
-                        let result = entry();
-                        vga::puts(b"hello.rs returned ");
-                        vga::putchar(b'0' + result as u8);
-                        vga::putchar(b'\n');
-                    } else {
-                        vga::puts(b"FAIL read hello.bin\n");
+                #[cfg(target_arch = "x86")]
+                {
+                    vga::puts(b"Compiling hello.rs...\n");
+                    if rc::rc_compile(b"hello.rs\0".as_ptr(), b"hello.bin\0".as_ptr()) != 0 {
+                        vga::puts(b"FAIL compile hello.rs\n");
+                        vga::puts(b"AUTOTEST END\n");
+                        loop { asm!("hlt"); }
                     }
-                } else {
-                    vga::puts(b"FAIL find hello.bin\n");
-                }
-
-                vga::puts(b"Compiling test.rs...\n");
-                if rc::rc_compile(b"test.rs\0".as_ptr(), b"test.bin\0".as_ptr()) == 0 {
-                    vga::puts(b"Running test.bin...\n");
-                    if let Some(node) = vfs::finddir_root(b"test.bin\0".as_ptr()) {
+                    vga::puts(b"Running hello.bin...\n");
+                    if let Some(node) = vfs::finddir_root(b"hello.bin\0".as_ptr()) {
                         let load = rc::emit::CC_LOAD_BASE as *mut u8;
-                        let n = vfs::read(node, 0, 65536, load);
+                        let n = vfs::read(node, 0, (*node).size, load);
                         if n > 0 {
                             let entry: extern "C" fn() -> i32 =
                                 core::mem::transmute(rc::emit::CC_LOAD_BASE as *const ());
                             let result = entry();
-                            if result == 0 {
-                                vga::puts(b"AUTOTEST PASS\n");
-                            } else {
-                                vga::puts(b"AUTOTEST FAIL\n");
+                            vga::puts(b"hello.rs returned ");
+                            vga::putchar(b'0' + result as u8);
+                            vga::putchar(b'\n');
+                        } else {
+                            vga::puts(b"FAIL read hello.bin\n");
+                        }
+                    } else {
+                        vga::puts(b"FAIL find hello.bin\n");
+                    }
+
+                    vga::puts(b"Compiling test.rs...\n");
+                    if rc::rc_compile(b"test.rs\0".as_ptr(), b"test.bin\0".as_ptr()) == 0 {
+                        vga::puts(b"Running test.bin...\n");
+                        if let Some(node) = vfs::finddir_root(b"test.bin\0".as_ptr()) {
+                            let load = rc::emit::CC_LOAD_BASE as *mut u8;
+                            let n = vfs::read(node, 0, 65536, load);
+                            if n > 0 {
+                                let entry: extern "C" fn() -> i32 =
+                                    core::mem::transmute(rc::emit::CC_LOAD_BASE as *const ());
+                                let result = entry();
+                                if result == 0 {
+                                    vga::puts(b"AUTOTEST PASS\n");
+                                } else {
+                                    vga::puts(b"AUTOTEST FAIL\n");
+                                }
                             }
                         }
+                    } else {
+                        vga::puts(b"AUTOTEST COMPILE FAIL\n");
                     }
-                } else {
-                    vga::puts(b"AUTOTEST COMPILE FAIL\n");
                 }
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    vga::puts(b"rc compiler not available on x86_64\n");
+                }
+
                 vga::puts(b"AUTOTEST END\n");
                 loop { asm!("hlt"); }
             }
