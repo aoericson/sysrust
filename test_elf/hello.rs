@@ -3,46 +3,55 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+/// Write a byte to COM1 serial port directly (no syscall needed)
+unsafe fn serial_putchar(c: u8) {
+    // Wait for transmit buffer empty (port 0x3FD bit 5)
+    loop {
+        let status: u8;
+        core::arch::asm!("in al, dx", in("dx") 0x3FDu16, out("al") status);
+        if status & 0x20 != 0 { break; }
+    }
+    // Write byte to COM1 data port 0x3F8
+    core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") c);
 }
 
-unsafe fn syscall1(nr: u32, arg1: u32) -> u32 {
-    let ret: u32;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") nr,
-            in("ebx") arg1,
-            lateout("eax") ret,
-            out("ecx") _,
-            out("edx") _,
-        );
+unsafe fn serial_puts(s: &[u8]) {
+    for &c in s {
+        serial_putchar(c);
     }
-    ret
-}
-
-unsafe fn syscall3(nr: u32, arg1: u32, arg2: u32, arg3: u32) -> u32 {
-    let ret: u32;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") nr,
-            in("ebx") arg1,
-            in("ecx") arg2,
-            in("edx") arg3,
-            lateout("eax") ret,
-        );
-    }
-    ret
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     unsafe {
-        let msg = b"Hello from ELF!\n";
-        syscall3(4, 1, msg.as_ptr() as u32, msg.len() as u32);
-        syscall1(1, 0);
+        serial_puts(b"[ELF64: alive via serial]\n");
+
+        // Now try int 0x80 syscall for write
+        serial_puts(b"[ELF64: trying int 0x80]\n");
+        core::arch::asm!(
+            "push rbx",
+            "mov rbx, 1",      // fd = stdout
+            "mov rcx, {buf}",  // buf
+            "mov rdx, 14",     // len
+            "mov rax, 4",      // sys_write
+            "int 0x80",
+            "pop rbx",
+            buf = in(reg) b"Hello syscall!\n".as_ptr() as u64,
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+        );
+        serial_puts(b"[ELF64: after int 0x80]\n");
+
+        // Exit
+        core::arch::asm!(
+            "push rbx",
+            "mov rbx, 0",
+            "mov rax, 1",
+            "int 0x80",
+            options(noreturn),
+        );
     }
-    loop {}
 }

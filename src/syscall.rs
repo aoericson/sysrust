@@ -101,18 +101,23 @@ unsafe fn sys_brk(addr: u64) -> u64 {
         // Shrinking not supported, just return current
         return CURRENT_BRK;
     }
-    // Map pages between current break and requested address
-    let mut page = CURRENT_BRK & !0xFFF;
-    let end_page = (addr + 0xFFF) & !0xFFF;
-    while page < end_page {
-        if vmm::get_physical(page) == 0 {
-            let phys = pmm::alloc_page();
-            if phys == 0 {
-                return CURRENT_BRK; // OOM
+    // Map pages between current break and requested address.
+    // Pages within the first 1GB are already identity-mapped by the boot
+    // assembly using 2MB huge pages, so we only need to allocate for
+    // addresses above 1GB.
+    if addr >= 0x4000_0000 {
+        let mut page = CURRENT_BRK & !0xFFF;
+        let end_page = (addr + 0xFFF) & !0xFFF;
+        while page < end_page {
+            if page >= 0x4000_0000 {
+                let phys = pmm::alloc_page();
+                if phys == 0 {
+                    return CURRENT_BRK; // OOM
+                }
+                vmm::map_page(page, phys, vmm::PAGE_PRESENT | vmm::PAGE_WRITE);
             }
-            vmm::map_page(page, phys, vmm::PAGE_PRESENT | vmm::PAGE_WRITE);
+            page += 0x1000;
         }
-        page += 0x1000;
     }
     CURRENT_BRK = addr;
     addr

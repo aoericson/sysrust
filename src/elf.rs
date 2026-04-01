@@ -190,21 +190,22 @@ unsafe fn load_elf32(data: *const u8, size: u32) -> Result<ElfInfo, &'static str
             return Err("ELF: segment extends past file");
         }
 
+        // Map memory for this segment
         let start_page = vaddr & !0xFFF;
         let end_page = (vaddr + memsz + 0xFFF) & !0xFFF;
-        let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITE;
 
-        let mut page = start_page;
-        while page < end_page {
-            if vmm::get_physical(page) == 0 {
+        // Addresses above 1GB need explicit page allocation.
+        // First 1GB is identity-mapped by boot (2MB huge pages).
+        if start_page >= 0x4000_0000 {
+            let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITE;
+            let mut page = start_page;
+            while page < end_page {
                 let phys = pmm::alloc_page();
-                if phys == 0 {
-                    return Err("ELF: out of memory");
-                }
+                if phys == 0 { return Err("ELF: out of memory"); }
                 vmm::map_page(page, phys, flags);
                 string::memset(page as *mut u8, 0, 0x1000);
+                page += 0x1000;
             }
-            page += 0x1000;
         }
 
         if filesz > 0 {
@@ -213,6 +214,9 @@ unsafe fn load_elf32(data: *const u8, size: u32) -> Result<ElfInfo, &'static str
                 data.add(offset as usize),
                 filesz as usize,
             );
+        }
+        if memsz > filesz {
+            string::memset((vaddr + filesz) as *mut u8, 0, (memsz - filesz) as usize);
         }
 
         let seg_end = vaddr + memsz;
@@ -281,21 +285,22 @@ unsafe fn load_elf64(data: *const u8, size: u32) -> Result<ElfInfo, &'static str
             return Err("ELF: segment extends past file");
         }
 
+        // Map memory for this segment
         let start_page = vaddr & !0xFFF;
         let end_page = (vaddr + memsz + 0xFFF) & !0xFFF;
-        let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITE;
 
-        let mut page = start_page;
-        while page < end_page {
-            if vmm::get_physical(page) == 0 {
+        // Addresses above 1GB need explicit page allocation.
+        // First 1GB is identity-mapped by boot (2MB huge pages).
+        if start_page >= 0x4000_0000 {
+            let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITE;
+            let mut page = start_page;
+            while page < end_page {
                 let phys = pmm::alloc_page();
-                if phys == 0 {
-                    return Err("ELF: out of memory");
-                }
+                if phys == 0 { return Err("ELF: out of memory"); }
                 vmm::map_page(page, phys, flags);
                 string::memset(page as *mut u8, 0, 0x1000);
+                page += 0x1000;
             }
-            page += 0x1000;
         }
 
         if filesz > 0 {
@@ -304,6 +309,9 @@ unsafe fn load_elf64(data: *const u8, size: u32) -> Result<ElfInfo, &'static str
                 data.add(offset as usize),
                 filesz as usize,
             );
+        }
+        if memsz > filesz {
+            string::memset((vaddr + filesz) as *mut u8, 0, (memsz - filesz) as usize);
         }
 
         let seg_end = vaddr + memsz;
