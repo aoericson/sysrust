@@ -1,6 +1,6 @@
 # opsys / sysrust Feature Matrix
 
-Last updated: 2026-03-29
+Last updated: 2026-04-02
 
 ## Status Legend
 
@@ -150,8 +150,24 @@ Each OS has its own compiler matching its language. opsys compiles C; sysrust co
 
 | Feature                  | opsys (C) | sysrust (Rust) | Notes |
 |--------------------------|-----------|----------------|-------|
-| mkinitrd (host tool)     | C binary  | TODO: build.rs | Fold into cargo build process |
-| Test programs language   | .c files  | TODO: .rs files | Match guest compiler language |
+| mkinitrd (host tool)     | C binary  | Rust binary    | `rustc -o tools/mkinitrd tools/mkinitrd.rs` |
+| Test programs language   | .c files  | .rs files      | 21 Rust-syntax programs, 15/15 autotest pass |
+
+### x86_64 / ELF (sysrust only)
+
+| Feature                  | opsys (C) | sysrust (Rust) | Notes |
+|--------------------------|-----------|----------------|-------|
+| Architecture             | i686 (32-bit) | x86_64 (64-bit) | sysrust ported to long mode |
+| Paging                   | 2-level   | 4-level (PML4) | sysrust: 4GB identity map |
+| ELF loader               | N/A       | OK (ELF32+ELF64) | Loads cross-compiled Rust binaries |
+| Linux syscall (syscall instr) | N/A  | OK             | x86_64 ABI, 40+ syscalls |
+| mmap                     | N/A       | OK             | Anonymous memory allocation |
+| VFS directories          | N/A       | OK             | mkdir, resolve_path, unlink, rename |
+| Free-list allocator (rt) | N/A       | OK             | sysrust-rt with dealloc support |
+| 4GB RAM                  | N/A       | OK             | QEMU -m 4096, 3GB usable |
+| TLS (arch_prctl)         | N/A       | OK             | FS segment base for thread-local storage |
+| getrandom                | N/A       | OK             | Timer-based PRNG for HashMap seeds |
+| Real Rust programs       | N/A       | OK             | Vec, String, format!, closures, iterators, Box |
 
 ### Crash Recovery
 
@@ -188,44 +204,47 @@ Each OS has its own compiler matching its language. opsys compiles C; sysrust co
 - [x] VGA volatile writes
 - [x] Initial commit + push
 
-### M2: sysrust Rust-Subset Compiler
+### M2: sysrust Zero C + Rust-Syntax Compiler -- DONE (2026-03-29)
 
-Replace the C compiler with a Rust-subset compiler. Zero C code in sysrust.
+- [x] mkinitrd.rs replaces mkinitrd.c
+- [x] Rust-syntax lexer + parser (rc/)
+- [x] 21 .rs test programs, 15/15 autotest pass
+- [x] Zero C files in repository
 
-- [ ] Remove tools/mkinitrd.c, fold into build.rs
-- [ ] Design Rust-subset language spec
-- [ ] New lexer (rc/lex.rs) for Rust tokens
-- [ ] New parser (rc/parse.rs) for Rust syntax, single-pass codegen
-- [ ] Adapt symbol table (rc/sym.rs) for Rust-style declarations
-- [ ] Reuse x86 emitter (rc/emit.rs) from existing cc/emit.rs
-- [ ] Update shell: `rc` command replaces `cc`
-- [ ] Rewrite 23 test programs in Rust subset
-- [ ] Update autotest mode for .rs programs
-- [ ] Remove all .c files from programs/
+### M3: sysrust x86_64 Port -- DONE (2026-03-30)
 
-### M3: opsys Self-Hosting Compiler
+- [x] 64-bit long mode (PAE, EFER.LME, 4-level paging)
+- [x] 64-bit ISR stubs, IDT, GDT, context switch
+- [x] ELF64 loader + Linux syscall instruction support
+- [x] sysrust-rt runtime crate (allocator, syscall wrappers)
+- [x] Real Rust programs with alloc (Vec, String, format!, closures)
+
+### M4: sysrust OS Infrastructure for rustc -- DONE (2026-04-02)
+
+- [x] 4GB RAM support (PMM, 4GB identity map, QEMU -m 4096)
+- [x] VFS directories (mkdir, resolve_path, unlink, rename)
+- [x] 9 new syscalls (lseek, fstat, getcwd, mkdir, getdents64, getrandom, rename, unlink, unlinkat)
+- [x] Free-list allocator for sysrust-rt (dealloc support)
+
+### M5: sysrust rustc Self-Hosting -- IN PROGRESS
+
+Official rustc compiles itself inside sysrust. See docs/RUSTC_SELFHOST_PLAN.md.
+
+- [x] Fork rust-lang/rust with sysrust target spec + PAL
+- [ ] Fix stage0/source version mismatch (re-clone at release tag)
+- [ ] Build std for x86_64-unknown-sysrust
+- [ ] Cross-compile rustc (cranelift backend) for sysrust
+- [ ] Run rustc inside sysrust
+- [ ] Build sysrust-link (Rust-based ELF linker)
+- [ ] Self-hosting bootstrap: rustc compiles itself
+
+### M6: opsys Self-Hosting Compiler
 
 The C compiler inside opsys can compile its own source.
 
 - [ ] Remaining C language features needed for self-hosting
 - [ ] Multi-file compilation or large-file support
 - [ ] Self-hosting test
-
-### M4: sysrust Self-Hosting Compiler
-
-The Rust-subset compiler inside sysrust can compile its own source.
-
-- [ ] Sufficient language features for self-hosting
-- [ ] Self-hosting test
-
-### M5: Shared Next-Generation Features
-
-New features developed in both projects (each in their own language).
-
-- [ ] TCP server
-- [ ] Ring 3 / userspace isolation
-- [ ] ELF loading
-- [ ] Process isolation (separate address spaces)
 
 ---
 
@@ -235,6 +254,11 @@ New features developed in both projects (each in their own language).
 |------|---------|-------|---------|--------|
 | 2026-03-29 | Guest language | C | Rust subset | Each OS is pure in its own language |
 | 2026-03-29 | Built-in compiler | cc (C compiler) | rc (Rust compiler) | Language purity |
-| 2026-03-29 | Host tools | mkinitrd.c | build.rs | No C code in sysrust |
+| 2026-03-29 | Host tools | mkinitrd.c | mkinitrd.rs | No C code in sysrust |
 | 2026-03-29 | Test programs | .c files | .rs files | Match guest language |
 | 2026-03-29 | Serial port | :2323 | :2324 | Avoid conflict when running side-by-side |
+| 2026-03-30 | Architecture | i686 (32-bit) | x86_64 (64-bit) | Required for cranelift backend |
+| 2026-03-30 | ELF loader | None | ELF32+ELF64 | Runs cross-compiled Rust binaries |
+| 2026-04-01 | Linux syscall compat | None | syscall instruction | Enables running Linux-target binaries |
+| 2026-04-02 | RAM | 512MB max | 4GB | Required for rustc compilation |
+| 2026-04-02 | VFS directories | Flat root only | Full directory tree | Required for rustc source tree |
