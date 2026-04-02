@@ -196,7 +196,7 @@ unsafe fn load_elf32(data: *const u8, size: u32) -> Result<ElfInfo, &'static str
 
         // Addresses above 1GB need explicit page allocation.
         // First 1GB is identity-mapped by boot (2MB huge pages).
-        if start_page >= 0x4000_0000 {
+        if start_page >= 0x1_0000_0000 {
             let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITE;
             let mut page = start_page;
             while page < end_page {
@@ -291,7 +291,7 @@ unsafe fn load_elf64(data: *const u8, size: u32) -> Result<ElfInfo, &'static str
 
         // Addresses above 1GB need explicit page allocation.
         // First 1GB is identity-mapped by boot (2MB huge pages).
-        if start_page >= 0x4000_0000 {
+        if start_page >= 0x1_0000_0000 {
             let flags = vmm::PAGE_PRESENT | vmm::PAGE_WRITE;
             let mut page = start_page;
             while page < end_page {

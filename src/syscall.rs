@@ -5,15 +5,18 @@
 // 2. syscall instruction (x86_64 ABI): nr in rax, args in rdi/rsi/rdx/r10/r8/r9
 //
 // The x86_64 syscall numbers follow the Linux convention:
-//   0=read, 1=write, 2=open, 3=close, 9=mmap, 11=munmap, 12=brk,
-//   20=writev, 60=exit, 231=exit_group, etc.
+//   0=read, 1=write, 2=open, 3=close, 5=fstat, 8=lseek, 9=mmap,
+//   11=munmap, 12=brk, 20=writev, 60=exit, 79=getcwd, 82=rename,
+//   83=mkdir, 87=unlink, 217=getdents64, 231=exit_group, 263=unlinkat,
+//   318=getrandom, etc.
 
 use core::arch::asm;
 use crate::idt::{self, Registers};
-use crate::vfs;
+use crate::vfs::{self, VfsNode};
 use crate::vga;
 use crate::vmm;
 use crate::pmm;
+use crate::string;
 
 // Current program break
 static mut CURRENT_BRK: u64 = 0;
@@ -87,6 +90,7 @@ unsafe extern "C" fn syscall_dispatch_x64(
         2   => sys_open(a1, a2),                 // open(path, flags)
         3   => sys_close(a1),                    // close(fd)
         5   => sys_fstat(a1, a2),                // fstat(fd, statbuf)
+        8   => sys_lseek(a1, a2, a3),            // lseek(fd, offset, whence)
         9   => sys_mmap(a1, a2, a3, a4, a5),     // mmap(addr, len, prot, flags, fd)
         10  => 0,                                 // mprotect stub
         11  => sys_munmap(a1, a2),               // munmap(addr, len)
@@ -100,18 +104,24 @@ unsafe extern "C" fn syscall_dispatch_x64(
         60  => { sys_exit(a1); 0 }               // exit(code)
         63  => 0,                                 // uname stub
         72  => 0,                                 // fcntl stub
-        79  => 0,                                 // getcwd stub
+        79  => sys_getcwd(a1, a2),               // getcwd(buf, size)
+        82  => sys_rename(a1, a2),               // rename(oldpath, newpath)
+        83  => sys_mkdir(a1, a2),                // mkdir(path, mode)
+        87  => sys_unlink(a1),                   // unlink(path)
         96  => 0,                                 // gettimeofday stub
         102 => 0,                                 // getuid
         104 => 0,                                 // getgid
         107 => 0,                                 // geteuid
         108 => 0,                                 // getegid
         158 => sys_arch_prctl(a1, a2),             // arch_prctl(code, addr)
+        217 => sys_getdents64(a1, a2, a3),       // getdents64(fd, buf, count)
         218 => 0,                                 // set_tid_address stub
         228 => 0,                                 // clock_gettime stub
         231 => { sys_exit(a1); 0 }               // exit_group(code)
         257 => sys_openat(a1, a2, a3),           // openat(dirfd, path, flags)
+        263 => sys_unlinkat(a1, a2, a3),         // unlinkat(dirfd, path, flags)
         302 => 0,                                 // prlimit64 stub
+        318 => sys_getrandom(a1, a2, a3),        // getrandom(buf, count, flags)
         334 => 0,                                 // rseq stub
         _   => {
             // Unknown syscall -- return -ENOSYS
@@ -132,11 +142,20 @@ fn int80_handler(regs: *mut Registers) {
             4   => sys_write((*regs).rbx, (*regs).rcx, (*regs).rdx),
             5   => sys_open((*regs).rbx, 0),
             6   => sys_close((*regs).rbx),
+            8   => sys_lseek((*regs).rbx, (*regs).rcx, (*regs).rdx),
+            19  => sys_lseek((*regs).rbx, (*regs).rcx, (*regs).rdx), // lseek (i386 nr)
+            28  => sys_fstat((*regs).rbx, (*regs).rcx),              // fstat (i386 nr)
+            39  => sys_mkdir((*regs).rbx, (*regs).rcx),              // mkdir (i386 nr)
+            10  => sys_unlink((*regs).rbx),                          // unlink (i386 nr)
+            38  => sys_rename((*regs).rbx, (*regs).rcx),             // rename (i386 nr)
             45  => sys_brk((*regs).rbx),
             54  => (-1i64) as u64,
             90  => (-1i64) as u64,
             91  => 0,
+            141 => sys_getdents64((*regs).rbx, (*regs).rcx, (*regs).rdx), // getdents64 (approx)
             146 => sys_writev((*regs).rbx, (*regs).rcx, (*regs).rdx),
+            183 => sys_getcwd((*regs).rbx, (*regs).rcx),            // getcwd (i386 nr)
+            355 => sys_getrandom((*regs).rbx, (*regs).rcx, (*regs).rdx), // getrandom (i386 nr)
             _   => (-38i64) as u64,
         };
         (*regs).rax = ret;
@@ -190,12 +209,324 @@ unsafe fn sys_ioctl(_fd: u64, _cmd: u64) -> u64 {
     (-25i64) as u64
 }
 
-unsafe fn sys_fstat(_fd: u64, _statbuf: u64) -> u64 {
-    // Stub: zero the stat buffer and return success
-    if _statbuf != 0 {
-        crate::string::memset(_statbuf as *mut u8, 0, 144); // sizeof(struct stat) on x86_64
+// ---- lseek: set file offset ---
+
+unsafe fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
+    let result = vfs::vfs_lseek(fd as i32, offset as i64, whence as u32);
+    result as u64
+}
+
+// ---- fstat: return real file info ---
+
+unsafe fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
+    if statbuf == 0 {
+        return (-14i64) as u64; // EFAULT
+    }
+
+    // Zero the stat buffer (sizeof(struct stat) = 144 on x86_64)
+    string::memset(statbuf as *mut u8, 0, 144);
+
+    // Check if fd is valid
+    if fd as usize >= vfs::FD_TABLE_SIZE || !vfs::FD_TABLE[fd as usize].in_use {
+        return (-9i64) as u64; // EBADF
+    }
+
+    let node = vfs::FD_TABLE[fd as usize].node;
+    if node.is_null() {
+        return (-9i64) as u64; // EBADF
+    }
+
+    // Populate st_size at offset 48 (u64) in struct stat
+    let size_ptr = (statbuf + 48) as *mut u64;
+    *size_ptr = (*node).size as u64;
+
+    // Populate st_mode at offset 24 (u32) with basic type bits
+    let mode_ptr = (statbuf + 24) as *mut u32;
+    if (*node).flags & vfs::VFS_DIRECTORY != 0 {
+        *mode_ptr = 0o040755; // S_IFDIR | rwxr-xr-x
+    } else {
+        *mode_ptr = 0o100644; // S_IFREG | rw-r--r--
+    }
+
+    // Populate st_ino at offset 0 (u64)
+    let ino_ptr = statbuf as *mut u64;
+    *ino_ptr = (*node).inode as u64;
+
+    // Populate st_blksize at offset 56 (u64) -- advisory block size
+    let blksz_ptr = (statbuf + 56) as *mut u64;
+    *blksz_ptr = 4096;
+
+    0
+}
+
+// ---- getcwd: return current working directory ---
+
+unsafe fn sys_getcwd(buf: u64, size: u64) -> u64 {
+    if buf == 0 || size == 0 {
+        return (-14i64) as u64; // EFAULT
+    }
+    // We don't track per-process cwd, always return "/"
+    if size < 2 {
+        return (-34i64) as u64; // ERANGE
+    }
+    let p = buf as *mut u8;
+    *p = b'/';
+    *p.add(1) = 0;
+    buf
+}
+
+// ---- mkdir: create directory ---
+
+unsafe fn sys_mkdir(path: u64, _mode: u64) -> u64 {
+    if path == 0 {
+        return (-14i64) as u64; // EFAULT
+    }
+    let result = vfs::mkdir_p(path as *const u8);
+    if result.is_null() {
+        return (-12i64) as u64; // ENOMEM
     }
     0
+}
+
+// ---- getdents64: list directory contents ---
+
+unsafe fn sys_getdents64(fd: u64, buf: u64, count: u64) -> u64 {
+    if buf == 0 || count == 0 {
+        return (-14i64) as u64; // EFAULT
+    }
+
+    // Validate fd
+    if fd as usize >= vfs::FD_TABLE_SIZE || !vfs::FD_TABLE[fd as usize].in_use {
+        return (-9i64) as u64; // EBADF
+    }
+
+    let node = vfs::FD_TABLE[fd as usize].node;
+    if node.is_null() {
+        return (-9i64) as u64; // EBADF
+    }
+
+    // Must be a directory
+    if (*node).flags & vfs::VFS_DIRECTORY == 0 {
+        return (-20i64) as u64; // ENOTDIR
+    }
+
+    // Use the fd offset to track which entry we're at
+    let start_idx = vfs::FD_TABLE[fd as usize].offset;
+    let mut pos: u64 = 0; // bytes written into buf
+    let mut idx = start_idx;
+
+    loop {
+        let child = vfs::readdir(node, idx);
+        if child.is_null() {
+            break; // no more entries
+        }
+
+        // Compute entry size: d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + name + null
+        let name_len = string::strlen((*child).name.as_ptr());
+        // reclen must be 8-byte aligned
+        let reclen_raw = 8 + 8 + 2 + 1 + name_len + 1; // +1 for null terminator
+        let reclen = (reclen_raw + 7) & !7; // align to 8 bytes
+
+        // Check if this entry fits in the remaining buffer
+        if pos + reclen as u64 > count {
+            break;
+        }
+
+        let entry = (buf + pos) as *mut u8;
+
+        // Zero the entry area for padding
+        string::memset(entry, 0, reclen);
+
+        // d_ino (offset 0, u64) -- use inode or index
+        let d_ino_ptr = entry as *mut u64;
+        *d_ino_ptr = if (*child).inode != 0 {
+            (*child).inode as u64
+        } else {
+            (idx + 1) as u64
+        };
+
+        // d_off (offset 8, u64) -- offset to next entry
+        let d_off_ptr = entry.add(8) as *mut u64;
+        *d_off_ptr = (idx + 1) as u64;
+
+        // d_reclen (offset 16, u16)
+        let d_reclen_ptr = entry.add(16) as *mut u16;
+        *d_reclen_ptr = reclen as u16;
+
+        // d_type (offset 18, u8)
+        let d_type_ptr = entry.add(18);
+        if (*child).flags & vfs::VFS_DIRECTORY != 0 {
+            *d_type_ptr = 4; // DT_DIR
+        } else {
+            *d_type_ptr = 8; // DT_REG
+        }
+
+        // d_name (offset 19, null-terminated)
+        string::memcpy(entry.add(19), (*child).name.as_ptr(), name_len);
+        *entry.add(19 + name_len) = 0;
+
+        pos += reclen as u64;
+        idx += 1;
+    }
+
+    // Update the fd offset so the next call continues where we left off
+    vfs::FD_TABLE[fd as usize].offset = idx;
+
+    // If we didn't emit any entries but there are no more children, return 0 (EOF)
+    // If we didn't emit any entries and there are children but none fit, return -EINVAL
+    if pos == 0 && !vfs::readdir(node, start_idx).is_null() {
+        return (-22i64) as u64; // EINVAL - buffer too small
+    }
+
+    pos
+}
+
+// ---- getrandom: fill buffer with pseudo-random bytes ---
+
+unsafe fn sys_getrandom(buf: u64, count: u64, _flags: u64) -> u64 {
+    if buf == 0 {
+        return (-14i64) as u64; // EFAULT
+    }
+
+    let ticks = crate::timer::get_ticks() as u64;
+    let ptr = buf as *mut u8;
+
+    // Simple LCG-based PRNG seeded from timer ticks
+    let mut state: u64 = ticks.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+
+    for i in 0..count as usize {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *ptr.add(i) = (state >> 33) as u8;
+    }
+
+    count
+}
+
+// ---- rename: rename/move a file ---
+
+unsafe fn sys_rename(oldpath: u64, newpath: u64) -> u64 {
+    if oldpath == 0 || newpath == 0 {
+        return (-14i64) as u64; // EFAULT
+    }
+
+    let old_path = oldpath as *const u8;
+    let new_path = newpath as *const u8;
+
+    // Resolve the old node
+    let old_node = vfs::resolve_path(old_path);
+    if old_node.is_null() {
+        return (-2i64) as u64; // ENOENT
+    }
+
+    // Find old parent and old name
+    let old_parent = (*old_node).parent;
+    if old_parent.is_null() {
+        return (-1i64) as u64; // can't rename root
+    }
+
+    // Parse the new path to get new parent + new name
+    let new_len = string::strlen(new_path);
+    if new_len == 0 {
+        return (-22i64) as u64; // EINVAL
+    }
+
+    // Find last slash in new path
+    let mut last_slash: i32 = -1;
+    for i in 0..new_len {
+        if *new_path.add(i) == b'/' {
+            last_slash = i as i32;
+        }
+    }
+
+    let new_parent: *mut VfsNode;
+    let new_name: *const u8;
+
+    if last_slash < 0 {
+        // No slash -> new file in root
+        new_parent = vfs::VFS_ROOT;
+        new_name = new_path;
+    } else if last_slash == 0 {
+        // Directly under root
+        new_parent = vfs::VFS_ROOT;
+        new_name = new_path.add(1);
+    } else {
+        // Build parent path
+        let plen = last_slash as usize;
+        let mut parent_buf = [0u8; 256];
+        if plen >= 255 {
+            return (-36i64) as u64; // ENAMETOOLONG
+        }
+        string::memcpy(parent_buf.as_mut_ptr(), new_path, plen);
+        parent_buf[plen] = 0;
+
+        new_parent = vfs::resolve_path(parent_buf.as_ptr());
+        if new_parent.is_null() {
+            return (-2i64) as u64; // ENOENT
+        }
+        new_name = new_path.add(last_slash as usize + 1);
+    }
+
+    if *new_name == 0 {
+        return (-22i64) as u64; // EINVAL
+    }
+
+    // Remove old_node from old_parent's children list (without freeing it)
+    let old_count = (*old_parent).num_children as usize;
+    let mut found_idx: Option<usize> = None;
+    for i in 0..old_count {
+        if (*old_parent).children[i] == old_node {
+            found_idx = Some(i);
+            break;
+        }
+    }
+
+    match found_idx {
+        None => return (-2i64) as u64, // ENOENT
+        Some(idx) => {
+            let last = old_count - 1;
+            for i in idx..last {
+                (*old_parent).children[i] = (*old_parent).children[i + 1];
+            }
+            (*old_parent).children[last] = core::ptr::null_mut();
+            (*old_parent).num_children -= 1;
+        }
+    }
+
+    // Rename the node
+    let name_len = string::strlen(new_name);
+    let copy_len = if name_len > 63 { 63 } else { name_len };
+    string::memset((*old_node).name.as_mut_ptr(), 0, 64);
+    string::memcpy((*old_node).name.as_mut_ptr(), new_name, copy_len);
+    (*old_node).name[copy_len] = 0;
+
+    // Add to new parent
+    if vfs::add_child(new_parent, old_node) < 0 {
+        // Try to re-add to old parent as fallback
+        let _ = vfs::add_child(old_parent, old_node);
+        return (-28i64) as u64; // ENOSPC
+    }
+
+    0
+}
+
+// ---- unlink: delete a file ---
+
+unsafe fn sys_unlink(path: u64) -> u64 {
+    if path == 0 {
+        return (-14i64) as u64; // EFAULT
+    }
+    let result = vfs::unlink_path(path as *const u8);
+    if result < 0 {
+        return (-2i64) as u64; // ENOENT
+    }
+    0
+}
+
+// ---- unlinkat: delete a file relative to dirfd ---
+
+unsafe fn sys_unlinkat(_dirfd: u64, path: u64, _flags: u64) -> u64 {
+    // Ignore dirfd, treat path as absolute or relative to root
+    sys_unlink(path)
 }
 
 unsafe fn sys_brk(addr: u64) -> u64 {
@@ -206,11 +537,11 @@ unsafe fn sys_brk(addr: u64) -> u64 {
         return CURRENT_BRK;
     }
     // Pages within first 1GB already mapped by boot
-    if addr >= 0x4000_0000 {
+    if addr >= 0x1_0000_0000 {
         let mut page = CURRENT_BRK & !0xFFF;
         let end_page = (addr + 0xFFF) & !0xFFF;
         while page < end_page {
-            if page >= 0x4000_0000 {
+            if page >= 0x1_0000_0000 {
                 let phys = pmm::alloc_page();
                 if phys == 0 { return CURRENT_BRK; }
                 vmm::map_page(page, phys, vmm::PAGE_PRESENT | vmm::PAGE_WRITE);
@@ -222,7 +553,7 @@ unsafe fn sys_brk(addr: u64) -> u64 {
     addr
 }
 
-/// mmap — allocate anonymous memory (MAP_ANONYMOUS) or stub for file mapping.
+/// mmap -- allocate anonymous memory (MAP_ANONYMOUS) or stub for file mapping.
 unsafe fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64) -> u64 {
     if len == 0 {
         return (-22i64) as u64; // EINVAL
@@ -257,7 +588,7 @@ unsafe fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64) -> u64
     vaddr
 }
 
-/// arch_prctl — set/get architecture-specific thread state.
+/// arch_prctl -- set/get architecture-specific thread state.
 /// ARCH_SET_FS (0x1002) sets the FS segment base for TLS.
 unsafe fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
     const ARCH_SET_FS: u64 = 0x1002;

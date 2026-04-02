@@ -21,11 +21,15 @@ align 4
     dd CHECKSUM
 
 ; Bootstrap page tables in BSS (must be page-aligned)
+; 4 Page Directories for 4GB identity mapping (4 × 512 × 2MB = 4GB)
 section .bss
 align 4096
 boot_pml4:    resb 4096
 boot_pdpt:    resb 4096
-boot_pd:      resb 4096
+boot_pd0:     resb 4096    ; PD for 0-1GB
+boot_pd1:     resb 4096    ; PD for 1-2GB
+boot_pd2:     resb 4096    ; PD for 2-3GB
+boot_pd3:     resb 4096    ; PD for 3-4GB
 
 align 16
 stack_bottom: resb 16384
@@ -44,27 +48,70 @@ _start:
     mov edi, eax          ; save magic in EDI (will be RDI in 64-bit)
     mov esi, ebx          ; save info pointer in ESI (will be RSI in 64-bit)
 
-    ; Set up bootstrap page tables for identity-mapping first 1GB
+    ; Set up bootstrap page tables for identity-mapping first 4GB
     ; PML4[0] -> boot_pdpt
     mov eax, boot_pdpt
     or  eax, 0x03         ; present + writable
     mov [boot_pml4], eax
 
-    ; PDPT[0] -> boot_pd
-    mov eax, boot_pd
+    ; PDPT[0..3] -> boot_pd0..3 (4 page directories for 4GB)
+    mov eax, boot_pd0
     or  eax, 0x03
     mov [boot_pdpt], eax
+    mov eax, boot_pd1
+    or  eax, 0x03
+    mov [boot_pdpt + 8], eax
+    mov eax, boot_pd2
+    or  eax, 0x03
+    mov [boot_pdpt + 16], eax
+    mov eax, boot_pd3
+    or  eax, 0x03
+    mov [boot_pdpt + 24], eax
 
-    ; PD[0..511] -> 2MB huge pages identity-mapping 0..1GB
-    mov ecx, 0            ; counter
+    ; Fill all 4 PDs: 4 × 512 entries × 2MB = 4GB identity map
+    ; PD0: 0x00000000 - 0x3FFFFFFF (0-1GB)
+    mov ecx, 0
     mov eax, 0x83         ; present + writable + page_size(2MB)
-.fill_pd:
-    mov [boot_pd + ecx*8], eax
-    mov dword [boot_pd + ecx*8 + 4], 0  ; high 32 bits = 0
-    add eax, 0x200000     ; next 2MB page
+.fill_pd0:
+    mov [boot_pd0 + ecx*8], eax
+    mov dword [boot_pd0 + ecx*8 + 4], 0
+    add eax, 0x200000
     inc ecx
     cmp ecx, 512
-    jne .fill_pd
+    jne .fill_pd0
+
+    ; PD1: 0x40000000 - 0x7FFFFFFF (1-2GB)
+    mov ecx, 0
+    mov eax, 0x40000083   ; 1GB base + present + writable + page_size
+.fill_pd1:
+    mov [boot_pd1 + ecx*8], eax
+    mov dword [boot_pd1 + ecx*8 + 4], 0
+    add eax, 0x200000
+    inc ecx
+    cmp ecx, 512
+    jne .fill_pd1
+
+    ; PD2: 0x80000000 - 0xBFFFFFFF (2-3GB)
+    mov ecx, 0
+    mov eax, 0x80000083
+.fill_pd2:
+    mov [boot_pd2 + ecx*8], eax
+    mov dword [boot_pd2 + ecx*8 + 4], 0
+    add eax, 0x200000
+    inc ecx
+    cmp ecx, 512
+    jne .fill_pd2
+
+    ; PD3: 0xC0000000 - 0xFFFFFFFF (3-4GB)
+    mov ecx, 0
+    mov eax, 0xC0000083
+.fill_pd3:
+    mov [boot_pd3 + ecx*8], eax
+    mov dword [boot_pd3 + ecx*8 + 4], 0
+    add eax, 0x200000
+    inc ecx
+    cmp ecx, 512
+    jne .fill_pd3
 
     ; Load PML4 into CR3
     mov eax, boot_pml4

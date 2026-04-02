@@ -13,7 +13,7 @@ use crate::multiboot::{MultibootInfo, MmapEntry, MULTIBOOT_FLAG_MMAP};
 
 pub const PAGE_SIZE: u64 = 4096;
 
-const MAX_PAGES: u32 = 131072; // support up to 512MB
+const MAX_PAGES: u32 = 1048576; // support up to 4GB (1M pages × 4KB)
 
 static mut BITMAP: [u32; (MAX_PAGES / 32) as usize] = [0; (MAX_PAGES / 32) as usize];
 static mut TOTAL_PAGES: u32 = 0;

@@ -2,16 +2,17 @@
 //
 // Each file is backed by a kmalloc'd buffer that grows on demand.
 // Files live under vfs_root and are lost on reboot.
+// Supports creating files and directories inside subdirectories.
 
 use crate::heap;
 use crate::string;
-use crate::vfs::{self, VfsNode, VFS_FILE};
+use crate::vfs::{self, VfsNode, VFS_FILE, VFS_DIRECTORY};
 
 #[repr(C)]
-struct RamfsFileData {
-    data: *mut u8,
-    size: u32,
-    capacity: u32,
+pub struct RamfsFileData {
+    pub data: *mut u8,
+    pub size: u32,
+    pub capacity: u32,
 }
 
 static mut RAMFS_ROOT: *mut VfsNode = core::ptr::null_mut();
@@ -94,17 +95,51 @@ fn ramfs_write(node: *mut VfsNode, offset: u32, size: u32, buffer: *const u8) ->
     }
 }
 
+// ---- Directory operations for ramfs directories ------------------------------
+
+fn ramfs_readdir(dir: *mut VfsNode, index: u32) -> *mut VfsNode {
+    unsafe {
+        if (*dir).flags & VFS_DIRECTORY == 0 {
+            return core::ptr::null_mut();
+        }
+        if index >= (*dir).num_children {
+            return core::ptr::null_mut();
+        }
+        (*dir).children[index as usize]
+    }
+}
+
+fn ramfs_finddir(dir: *mut VfsNode, name: *const u8) -> *mut VfsNode {
+    unsafe {
+        if (*dir).flags & VFS_DIRECTORY == 0 {
+            return core::ptr::null_mut();
+        }
+        for i in 0..(*dir).num_children as usize {
+            if string::strcmp((*(*dir).children[i]).name.as_ptr(), name) == 0 {
+                return (*dir).children[i];
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
 // ---- Public API --------------------------------------------------------------
 
 /// Create a new writable ramfs file under the VFS root.
 /// Returns the existing node if a file with this name already exists.
 pub unsafe fn create_file(name: *const u8) -> *mut VfsNode {
-    if RAMFS_ROOT.is_null() || name.is_null() {
+    create_file_in(RAMFS_ROOT, name)
+}
+
+/// Create a new writable ramfs file under the given parent directory.
+/// Returns the existing node if a file with this name already exists.
+pub unsafe fn create_file_in(parent: *mut VfsNode, name: *const u8) -> *mut VfsNode {
+    if parent.is_null() || name.is_null() {
         return core::ptr::null_mut();
     }
 
     // Return existing file if one with this name already exists
-    let existing = vfs::finddir(RAMFS_ROOT, name);
+    let existing = vfs::finddir(parent, name);
     if !existing.is_null() {
         return existing;
     }
@@ -145,10 +180,59 @@ pub unsafe fn create_file(name: *const u8) -> *mut VfsNode {
 
     (*node).private_data = fd as *mut u8;
 
-    // Add to VFS root
-    if vfs::add_child(RAMFS_ROOT, node) < 0 {
+    // Add to parent directory
+    if vfs::add_child(parent, node) < 0 {
         heap::kfree((*fd).data);
         heap::kfree(fd as *mut u8);
+        heap::kfree(node as *mut u8);
+        return core::ptr::null_mut();
+    }
+    node
+}
+
+/// Create a directory node under the VFS root in ramfs.
+pub unsafe fn create_dir(name: *const u8) -> *mut VfsNode {
+    create_dir_in(RAMFS_ROOT, name)
+}
+
+/// Create a directory node under the given parent directory.
+/// Returns the existing directory node if one already exists.
+pub unsafe fn create_dir_in(parent: *mut VfsNode, name: *const u8) -> *mut VfsNode {
+    if parent.is_null() || name.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    // If a directory with this name already exists, return it
+    let existing = vfs::finddir(parent, name);
+    if !existing.is_null() {
+        if (*existing).flags & VFS_DIRECTORY != 0 {
+            return existing;
+        }
+        // Name collision with a non-directory
+        return core::ptr::null_mut();
+    }
+
+    // Allocate and zero the VFS node
+    let node = heap::kmalloc(core::mem::size_of::<VfsNode>()) as *mut VfsNode;
+    if node.is_null() {
+        return core::ptr::null_mut();
+    }
+    string::memset(node as *mut u8, 0, core::mem::size_of::<VfsNode>());
+
+    // Copy name (max 63 chars + null)
+    let len = string::strlen(name);
+    let copy_len = if len > 63 { 63 } else { len };
+    string::memcpy((*node).name.as_mut_ptr(), name, copy_len);
+    (*node).name[copy_len] = 0;
+
+    (*node).flags = VFS_DIRECTORY;
+    (*node).readdir_fn = Some(ramfs_readdir);
+    (*node).finddir_fn = Some(ramfs_finddir);
+    (*node).num_children = 0;
+    (*node).parent = core::ptr::null_mut();
+
+    // Add to parent directory
+    if vfs::add_child(parent, node) < 0 {
         heap::kfree(node as *mut u8);
         return core::ptr::null_mut();
     }
