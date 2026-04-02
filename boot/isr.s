@@ -126,4 +126,92 @@ isr_common_stub:
     add rsp, 16          ; skip int_no and err_code
     iretq                ; 64-bit interrupt return
 
+; ---------------------------------------------------------------------------
+; syscall_entry -- Entry point for the `syscall` instruction (x86_64 Linux ABI).
+;
+; On entry by CPU: RCX = return RIP, R11 = saved RFLAGS, RIP = LSTAR
+; Syscall args:    RAX = nr, RDI = a1, RSI = a2, RDX = a3, R10 = a4, R8 = a5, R9 = a6
+; Return:          RAX = result, then SYSRETQ restores RIP from RCX, RFLAGS from R11
+; ---------------------------------------------------------------------------
+extern syscall_dispatch_x64
+
+global syscall_entry
+syscall_entry:
+    ; On entry: RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5, R9=a6
+    ;           RCX=return RIP (saved by CPU), R11=saved RFLAGS
+
+    ; Save return state and callee-saved regs
+    push rcx            ; return RIP
+    push r11            ; saved RFLAGS
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Rearrange from Linux ABI to System V ABI:
+    ;   Linux:    rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5, r9=a6
+    ;   SysV:     rdi=nr, rsi=a1, rdx=a2, rcx=a3, r8=a4,  r9=a5
+    ;
+    ; Must be careful not to clobber values we still need.
+    ; Order matters: move rdi last (it's both source a1 and dest nr).
+    mov rcx, r10        ; a3: r10 -> rcx  (rcx was clobbered by CPU, free)
+    ; r8 stays (a4->a4), r9 stays (a5->a5)
+    ; rdx stays (a2->a2) -- WAIT: rdx is a3 in Linux, a2 in SysV
+    ; Actually: Linux rsi=a2 -> SysV rsi=a1... NO.
+    ;
+    ; Let me be precise:
+    ;   Linux arg1 = rdi  -> SysV arg1 = rsi
+    ;   Linux arg2 = rsi  -> SysV arg2 = rdx
+    ;   Linux arg3 = rdx  -> SysV arg3 = rcx  (done above via r10)
+    ; WAIT: Linux a3 is rdx, SysV a3 is rcx. Linux a4 is r10, mapped to SysV a3=rcx? No.
+    ;
+    ; Correct mapping:
+    ;   syscall_dispatch_x64(nr, a1, a2, a3, a4, a5)
+    ;   SysV:  rdi=nr, rsi=a1, rdx=a2, rcx=a3, r8=a4, r9=a5
+    ;   Linux: rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5
+    ;
+    ;   nr:  rax -> rdi
+    ;   a1:  rdi -> rsi   (rdi is also the source of nr's destination!)
+    ;   a2:  rsi -> rdx   (rsi also needs to become a1... wait)
+    ;
+    ; This is a 3-way register shuffle. Use a temp:
+    mov r15, rdx        ; save Linux a3 (rdx) in r15
+    mov rdx, rsi        ; SysV a2 = Linux a2 (rsi -> rdx)
+    mov rsi, rdi        ; SysV a1 = Linux a1 (rdi -> rsi)
+    mov rdi, rax        ; SysV nr = Linux nr (rax -> rdi)
+    mov rcx, r15        ; SysV a3 = Linux a3 (was rdx, saved in r15)
+    ; r8 = a4 (stays -- Linux r10 maps to SysV r8? NO)
+    ; Linux a4 = r10, SysV arg4 = r8. Need: mov r8_new = r10? But r8 has Linux a5.
+    ; Linux: r10=a4, r8=a5, r9=a6
+    ; SysV:  r8=a4,  r9=a5
+    ; So: r8_new = r10 (Linux a4), r9_new = r8 (Linux a5)
+    mov r15, r8         ; save Linux a5
+    mov r8, r10         ; SysV a4 = Linux a4 (r10 -> r8)
+    mov r9, r15         ; SysV a5 = Linux a5 (was r8, saved in r15)
+
+    ; Align stack to 16 bytes
+    mov rbp, rsp
+    and rsp, -16
+
+    call syscall_dispatch_x64
+
+    mov rsp, rbp
+
+    ; Restore callee-saved regs and return state
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11             ; RFLAGS for sysretq
+    pop rcx             ; return RIP for sysretq
+
+    ; Re-enable interrupts
+    sti
+
+    sysretq
+
 section .note.GNU-stack noalloc noexec nowrite progbits
